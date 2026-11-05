@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>质检规则优化台</title>
+  <link rel="stylesheet" href="/static/style.css?v=2.1.0" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo">QC</div>
+      <div>
+        <h1>质检规则优化台</h1>
+        <p>导入通话与人工复核结果，让大模型把选中的规则优化到目标准确率</p>
+      </div>
+    </div>
+    <div class="top-actions">
+      <span id="buildTag" class="muted" style="font-size:12px">v2.1</span>
+      <span id="modeBadge" class="badge badge-mock">模拟演示</span>
+      <button id="settingsBtn" class="btn ghost" type="button">模型设置</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <aside class="sidebar">
+      <div class="sidebar-head">
+        <span>质检规则</span>
+        <button id="newRuleBtn" class="btn small" type="button">+ 新建</button>
+      </div>
+      <input id="ruleSearch" class="search" placeholder="搜索规则名称" />
+      <div id="ruleList" class="rule-list"></div>
+      <div class="sidebar-foot">
+        每条规则由「正则」「语义」组成，按 OR / AND 组合；命中即判定违规。
+      </div>
+    </aside>
+
+    <section class="content">
+      <div class="content-head">
+        <div class="content-title">
+          <h2 id="ruleTitle">选择一条规则</h2>
+          <p id="ruleMeta" class="muted"></p>
+        </div>
+        <div class="head-actions">
+          <button id="deleteRuleBtn" class="btn danger ghost" type="button" hidden>删除规则</button>
+        </div>
+      </div>
+
+      <nav class="tabs" id="tabs">
+        <button class="tab active" data-tab="rule" type="button">1. 规则配置</button>
+        <button class="tab" data-tab="data" type="button">2. 训练数据</button>
+        <button class="tab" data-tab="optimize" type="button">3. 智能优化</button>
+        <button class="tab" data-tab="prompt" type="button">4. 通用提示词</button>
+      </nav>
+
+      <!-- ============ 规则配置 ============ -->
+      <div class="tab-panel" id="tab-rule">
+        <div class="card" id="ruleCard">
+          <div class="form-grid">
+            <label>
+              <span>规则编号 <em class="muted">与导入文件的规则编号对应，如 R003</em></span>
+              <input id="ruleCode" maxlength="20" placeholder="R005" spellcheck="false" />
+            </label>
+            <label>
+              <span>规则名称</span>
+              <input id="ruleName" maxlength="60" placeholder="例如：索要短信验证码" />
+            </label>
+            <label class="full">
+              <span>逻辑关系</span>
+              <select id="ruleLogic">
+                <option value="OR">OR 或：正则或语义任一命中即违规</option>
+                <option value="AND">AND 与：正则和语义都命中才违规</option>
+              </select>
+            </label>
+            <label class="full">
+              <span>业务说明</span>
+              <input id="ruleDesc" maxlength="500" placeholder="这条规则要防止什么问题" />
+            </label>
+            <label class="full">
+              <span>正则表达式 <em class="muted">Python re 语法，可为空</em></span>
+              <textarea id="ruleRegex" rows="4" spellcheck="false" placeholder="例如：验证码|动态密码"></textarea>
+            </label>
+            <label class="full">
+              <span>语义描述 <em class="muted">给大模型判断用的违规条件，可为空</em></span>
+              <textarea id="ruleSemantic" rows="4" placeholder="例如：坐席是否主动索要客户手机收到的短信验证码；提醒客户不要泄露不算。"></textarea>
+            </label>
+            <label class="full">
+              <span>本次修改理由 <em class="muted">修改正则 / 语义 / 逻辑时必填，会写入修改历史</em></span>
+              <textarea id="ruleChangeReason" rows="2" placeholder="例如：补充“动态密码”同义表达，减少漏报；同时排除“不要泄露”等提醒场景。"></textarea>
+            </label>
+          </div>
+          <div class="form-actions">
+            <button id="saveRuleBtn" class="btn primary" type="button">保存规则</button>
+            <span id="ruleVersion" class="muted"></span>
+          </div>
+        </div>
+
+        <div class="card" id="changeLogCard" hidden>
+          <div class="card-head">
+            <h3>修改历史与理由</h3>
+            <span class="muted">最近 50 条</span>
+          </div>
+          <div id="changeLogList" class="history-list"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h3>正则试跑</h3>
+            <span class="muted">只测正则，不调用模型</span>
+          </div>
+          <textarea id="testTranscript" rows="3" placeholder="粘贴一段通话文本，检查正则是否命中"></textarea>
+          <div class="form-actions">
+            <button id="testRegexBtn" class="btn ghost" type="button">测试是否命中</button>
+            <span id="testResult" class="muted"></span>
+          </div>
+        </div>
+      </div>
+
+      <!-- ============ 训练数据 ============ -->
+      <div class="tab-panel hidden" id="tab-data">
+        <div class="stats" id="datasetStats"></div>
+
+        <div class="card">
+          <div class="card-head">
+            <h3>导入通话数据（所有规则共用）</h3>
+            <div class="link-row">
+              <a id="sampleLink" class="link" href="/api/dataset/sample.csv">下载 10 通示例 CSV</a>
+              <a id="exportLink" class="link" href="/api/dataset/export.csv" hidden>导出全部通话</a>
+            </div>
+          </div>
+          <p class="hint">
+            支持 CSV / JSON / XLSX，四列：<b>通话ID</b>、<b>通话文本</b>、<b>自动违规规则</b>、<b>人工违规规则</b>。
+            规则列填规则编号（多条用 <code>;</code> 或 <code>、</code> 分隔），没有违规就留空。
+            同一通电话会按人工违规规则拆成每条规则的样本：编号在人工列中即「违规」，否则「正常」。
+          </p>
+          <div class="import-row">
+            <input id="fileInput" type="file" accept=".csv,.json,.xlsx,.txt" />
+            <select id="importMode">
+              <option value="replace">覆盖全部通话数据</option>
+              <option value="append">追加（按通话ID去重）</option>
+            </select>
+            <button id="uploadBtn" class="btn primary" type="button">导入</button>
+          </div>
+          <div id="importReport" class="report" hidden></div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h3>数据预览</h3>
+            <span id="datasetCount" class="muted"></span>
+          </div>
+          <div id="datasetTable" class="table-wrap"></div>
+          <p class="hint">
+            「自动是否正确」= 当前规则编号在「自动违规规则」和「人工违规规则」中的命中结果是否一致；
+            两边都没有该编号，也算正确（都认为该规则未违规）。
+          </p>
+        </div>
+      </div>
+
+      <!-- ============ 智能优化 ============ -->
+      <div class="tab-panel hidden" id="tab-optimize">
+        <div class="two-col">
+          <div class="card">
+            <h3>优化目标</h3>
+            <div class="form-grid compact">
+              <label>
+                <span>目标准确率（%）</span>
+                <input id="targetAccuracy" type="number" min="50" max="100" step="1" value="90" />
+              </label>
+              <label>
+                <span>最多优化轮次</span>
+                <input id="maxRounds" type="number" min="1" max="10" step="1" value="5" />
+              </label>
+              <label>
+                <span>每轮最多样本数</span>
+                <input id="sampleLimit" type="number" min="5" max="500" step="5" value="100" />
+              </label>
+            </div>
+            <div class="form-actions">
+              <button id="startBtn" class="btn primary" type="button">开始优化</button>
+              <button id="evaluateBtn" class="btn ghost" type="button">只评测当前规则</button>
+            </div>
+            <p id="optimizeHint" class="hint"></p>
+          </div>
+
+          <div class="card" id="progressCard" hidden>
+            <div class="card-head">
+              <h3 id="jobPhase">准备中</h3>
+              <span id="jobStatus" class="badge"></span>
+            </div>
+            <div class="progress"><div id="jobBar"></div></div>
+            <div class="progress-meta"><span id="jobProgressText"></span><span id="jobElapsed"></span></div>
+            <pre id="jobLog" class="log"></pre>
+            <button id="cancelBtn" class="btn ghost small" type="button">取消任务</button>
+          </div>
+        </div>
+
+        <div id="jobResult"></div>
+
+        <div class="card" id="casesCard" hidden>
+          <div class="card-head">
+            <h3>逐条判定结果</h3>
+            <div class="split-tabs" id="caseSplitTabs">
+              <button class="btn small split active" data-case-split="TRAIN" type="button">训练集（含语义理由）</button>
+              <button class="btn small split" data-case-split="VALIDATION" type="button">验证集（仅正则）</button>
+              <button class="btn small split" data-case-split="TEST" type="button">测试集（仅正则）</button>
+            </div>
+            <div class="filter-btns">
+              <button class="btn small filter active" data-filter="all" type="button">全部</button>
+              <button class="btn small filter" data-filter="errors" type="button">只看错误</button>
+            </div>
+          </div>
+          <div id="casesTable" class="table-wrap"></div>
+          <p class="hint">基线 = 优化前规则；最优 = 本轮最优候选。训练集同时生成正则与语义理由；验证集/测试集为控制时延，只生成正则理由，语义仅返回判定结果。</p>
+        </div>
+
+        <div class="card" id="historyCard" hidden>
+          <div class="card-head"><h3>最近优化记录</h3><span class="muted">最多保留 50 条</span></div>
+          <div id="historyList" class="history-list"></div>
+        </div>
+      </div>
+
+      <!-- ============ 通用提示词 ============ -->
+      <div class="tab-panel hidden" id="tab-prompt">
+        <div class="card">
+          <div class="card-head">
+            <h3>通用语义提示词</h3>
+            <span id="promptVersion" class="muted"></span>
+          </div>
+          <p class="hint">
+            生产上所有规则共用这段提示词；<code>{rules}</code> 会被替换成全部规则编号和语义描述。
+            修改后需要填写理由，优化任务也可能自动提出新的提示词。
+          </p>
+          <textarea id="semanticPrompt" rows="14" spellcheck="false" placeholder="你是...&#10;需要检查的规则有：&#10;{rules}"></textarea>
+          <label class="full" style="margin-top:12px">
+            <span>本次修改理由 <em class="muted">修改提示词时必填</em></span>
+            <textarea id="promptChangeReason" rows="2" placeholder="例如：补充“区分提醒、否定、引用”的要求，减少语义误判。"></textarea>
+          </label>
+          <div class="form-actions">
+            <button id="savePromptBtn" class="btn primary" type="button">保存提示词</button>
+            <span id="promptStatus" class="muted"></span>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h3>注入预览</h3><span class="muted">实际发给模型的系统提示词</span></div>
+          <pre id="promptPreview" class="prompt-preview"></pre>
+        </div>
+
+        <div class="card" id="promptHistoryCard" hidden>
+          <div class="card-head"><h3>提示词修改历史</h3><span class="muted">最近 30 条</span></div>
+          <div id="promptHistoryList" class="history-list"></div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <div id="toast" class="toast" hidden></div>
+
+  <dialog id="settingsDialog" class="dialog">
+    <form method="dialog" class="dialog-body">
+      <h3>模型设置</h3>
+      <p class="hint">
+        「模拟演示」不调用任何模型，用本地启发式算法演示流程；
+        「真实模型」支持 DeepSeek 或任意 OpenAI 兼容网关。
+      </p>
+      <label>
+        <span>运行模式</span>
+        <select id="settingMode">
+          <option value="mock">模拟演示（无需 API Key）</option>
+          <option value="deepseek">真实模型（OpenAI 兼容）</option>
+        </select>
+      </label>
+      <label>
+        <span>Base URL</span>
+        <input id="settingBaseUrl" placeholder="https://api.deepseek.com" />
+      </label>
+      <label>
+        <span>模型名</span>
+        <input id="settingModel" placeholder="deepseek-chat" />
+      </label>
+      <label>
+        <span>API Key <em class="muted">只保存在服务进程内存，不写盘</em></span>
+        <input id="settingApiKey" type="password" placeholder="留空表示不修改" autocomplete="off" />
+      </label>
+      <div id="settingsStatus" class="muted"></div>
+      <div class="dialog-actions">
+        <button id="testConnBtn" class="btn ghost" type="button">测试连接</button>
+        <button id="saveSettingsBtn" class="btn primary" type="button">保存设置</button>
+        <button value="cancel" class="btn ghost" type="button" id="closeSettingsBtn">关闭</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="/static/app.js?v=2.1.0"></script>
+</body>
+</html>

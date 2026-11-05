@@ -1,0 +1,14 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# runtime / local data
+.run/
+data/
+.release/
+*.log
+
+# secrets
+.env
+.env.*
