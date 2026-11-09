@@ -15,35 +15,43 @@
 
 *示意：30 通验证数据，训练/验证/测试三集均提升，泛化验收 PASS。*
 
-## 启动
+## 启动（离线内网版）
 
-在项目根目录双击 `start.cmd`，或执行：
+把压缩包拷贝到内网 Windows 机器，解压后进入 `qc-rule-optimizer` 目录，**双击 `start.cmd`**。
 
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\dev.ps1
-```
+- 不需要联网，不需要安装 Python、pip 或任何依赖；
+- 包内自带 Python 3.8.10 运行时和全部 wheel 依赖；
+- 首次启动约 10～20 秒，浏览器会自动打开 <http://127.0.0.1:8090>；
+- 停止：双击 `stop.cmd`。
 
-浏览器打开 <http://127.0.0.1:8090>。停止：
+如果浏览器没有自动弹出，手动打开 <http://127.0.0.1:8090>。运行日志在 `.run\app.log`，数据在 `data\store.json`。
 
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\stop.ps1
-```
+### 离线包内容
 
-也可以双击 `stop.cmd`。运行日志在 `.run\app.log`，数据在 `data\store.json`。
+| 目录/文件 | 说明 |
+| --- | --- |
+| `runtime\python` | 自带 Python 3.8.10（64 位）及已安装依赖 |
+| `wheelhouse` | 全部离线 wheel 包（cp38 / win_amd64） |
+| `app`、`static`、`scripts` | 程序和页面 |
+| `samples` | 10 通示例导入数据 |
+| `data\store.json` | 首次启动自动生成的本地数据 |
+
+### 如果自带运行时不可用
+
+`scripts\dev.ps1` 会自动回退到本机 `py -3.8` / `python`（必须是 3.8 64 位），
+从本地 `wheelhouse` 创建 `.venv` 并离线安装，不访问网络。详见 [OFFLINE.md](OFFLINE.md)。
 
 ## 本机环境
 
-所有项目文件、虚拟环境、数据和日志都在 E 盘，不写 C 盘：
+所有数据、日志和依赖都在解压目录内，不写系统目录：
 
 | 内容 | 位置 |
 | --- | --- |
-| 项目 | `E:\qc-rule-optimizer` |
-| Python 虚拟环境 | `E:\qc-rule-optimizer\.venv` |
-| 运行时（JDK / Maven / Node） | `E:\qc-runtimes` |
-| 数据文件 | `E:\qc-rule-optimizer\data\store.json` |
-| 运行日志 | `E:\qc-rule-optimizer\.run\app.log` |
-
-Python 解释器使用本机已有的 3.9（位于 C 盘系统目录，只读使用）；依赖装在 E 盘的 `.venv` 中。
+| 项目 | 解压后的 `qc-rule-optimizer` 目录 |
+| Python 运行时 | `runtime\python`（自带 3.8.10） |
+| 离线依赖 | `wheelhouse` |
+| 数据文件 | `data\store.json` |
+| 运行日志 | `.run\app.log` |
 
 ## 使用流程
 

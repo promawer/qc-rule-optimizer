@@ -15,6 +15,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 RUN_DIR = ROOT / ".run"
 RUN_DIR.mkdir(parents=True, exist_ok=True)
+(ROOT / "data").mkdir(parents=True, exist_ok=True)
 PID_FILE = RUN_DIR / "app.pid"
 LOG_FILE = RUN_DIR / "app.log"
 PORT = 8090
@@ -39,7 +40,7 @@ def main() -> int:
     env = dict(os.environ)
     env["PYTHONUTF8"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
-    env["PIP_CACHE_DIR"] = r"E:\qc-runtimes\pip-cache"
+    env["PYTHONUNBUFFERED"] = "1"
 
     flags = 0
     kwargs = {}

@@ -1,9 +1,15 @@
-﻿# 运行后端单元测试、字节码编译检查和前端 JS 语法检查。
+﻿# 离线环境自检：运行后端单元测试和字节码编译检查；有 Node 时再检查前端 JS。
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
-$python = Join-Path $root '.venv\Scripts\python.exe'
-if (-not (Test-Path -LiteralPath $python)) {
-  throw '未找到 .venv，请先运行 scripts\dev.ps1 初始化环境。'
+$bundled = Join-Path $root 'runtime\python\python.exe'
+$venvPython = Join-Path $root '.venv\Scripts\python.exe'
+
+if (Test-Path -LiteralPath $bundled) {
+  $python = $bundled
+} elseif (Test-Path -LiteralPath $venvPython) {
+  $python = $venvPython
+} else {
+  throw '未找到 Python 运行时，请先运行 start.cmd 初始化环境。'
 }
 
 $env:PYTHONUTF8 = '1'
@@ -22,11 +28,11 @@ try {
   Pop-Location
 }
 
-$node = 'E:\qc-runtimes\node\node.exe'
-if (Test-Path -LiteralPath $node) {
+$node = Get-Command node -ErrorAction SilentlyContinue
+if ($node) {
   Write-Host ''
   Write-Host '=== 前端 JS 语法检查 ===' -ForegroundColor Cyan
-  & $node --check (Join-Path $root 'static\app.js')
+  & $node.Source --check (Join-Path $root 'static\app.js')
   if ($LASTEXITCODE -ne 0) { throw '前端 JS 语法检查失败' }
 }
 
