@@ -62,14 +62,18 @@ $bundled = Join-Path $root 'runtime\python\python.exe'
 $venv = Join-Path $root '.venv'
 $venvPython = Join-Path $venv 'Scripts\python.exe'
 
+$python = $null
 if (Test-Path -LiteralPath $bundled) {
-  $python = $bundled
-  Write-Host '使用包内 Python 3.8 运行时。'
-  & $python -c "import fastapi, uvicorn, pydantic, httpx, openpyxl, multipart" 2>$null
-  if ($LASTEXITCODE -ne 0) {
-    throw '包内 Python 运行时缺少依赖，请确认 runtime\python\Lib\site-packages 完整。'
+  & $bundled -c "import fastapi, uvicorn, pydantic, httpx, openpyxl, multipart" 2>$null
+  if ($LASTEXITCODE -eq 0) {
+    $python = $bundled
+    Write-Host '使用包内 Python 3.8 运行时。'
+  } else {
+    Write-Host '包内 Python 3.8 无法加载，改用本机 Python 3.8 + wheelhouse…' -ForegroundColor Yellow
   }
-} else {
+}
+
+if (-not $python) {
   if (-not (Test-Path -LiteralPath $venvPython)) {
     $system = Find-Python38
     Write-Host '创建 Python 3.8 虚拟环境…'
@@ -81,7 +85,13 @@ if (Test-Path -LiteralPath $bundled) {
 
   $wheelhouse = Join-Path $root 'wheelhouse'
   $marker = Join-Path $venv '.deps-installed'
-  if (-not $SkipInstall -and -not (Test-Path -LiteralPath $marker)) {
+  $needInstall = -not (Test-Path -LiteralPath $marker)
+  if (-not $needInstall) {
+    $pydanticVersion = (& $python -c "import pydantic; print(getattr(pydantic, 'VERSION', ''))" 2>$null)
+    if ($pydanticVersion -notlike '1.10.*') { $needInstall = $true }
+  }
+
+  if (-not $SkipInstall -and $needInstall) {
     if (-not (Test-Path -LiteralPath $wheelhouse)) {
       throw '缺少 wheelhouse 离线依赖目录，请确认压缩包解压完整。'
     }
@@ -89,6 +99,11 @@ if (Test-Path -LiteralPath $bundled) {
     $env:PIP_DISABLE_PIP_VERSION_CHECK = '1'
     & $python -m pip install --no-index --find-links $wheelhouse --only-binary=:all: --no-cache-dir -r (Join-Path $root 'requirements.txt')
     if ($LASTEXITCODE -ne 0) { throw '离线依赖安装失败，请确认 wheelhouse 完整且 Python 为 3.8 64 位。' }
+    # Win7 上强制使用 Pydantic 1.x 的纯 Python 实现，避免任何编译扩展。
+    $pydanticDir = Join-Path $venv 'Lib\site-packages\pydantic'
+    if (Test-Path -LiteralPath $pydanticDir) {
+      Get-ChildItem $pydanticDir -Filter *.pyd -Recurse -ErrorAction SilentlyContinue | Remove-Item -Force
+    }
     New-Item -ItemType File -Path $marker | Out-Null
   }
 }

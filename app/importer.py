@@ -89,7 +89,13 @@ def _read_json(content: bytes) -> Tuple[List[str], List[List[object]]]:
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError(f"JSON 解析失败：{exc}") from exc
     if isinstance(payload, dict):
-        payload = payload.get("calls") or payload.get("cases") or payload.get("data") or payload.get("rows")
+        payload = (
+            payload.get("calls")
+            or payload.get("cases")
+            or payload.get("data")
+            or payload.get("rows")
+            or payload.get("rules")
+        )
     if not isinstance(payload, list) or not payload:
         raise ValueError("JSON 需要是非空数组，或包含 calls / cases / data / rows 数组")
     headers: List[str] = []

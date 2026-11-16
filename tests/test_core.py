@@ -3,11 +3,23 @@ import json
 import unittest
 from pathlib import Path
 
+import httpx
+
 from app.evaluator import EvaluationError, evaluate_rule
+from app.llm import (
+    LLMClient,
+    LLMError,
+    build_request_payload,
+    config_needs_api_key,
+    extract_path,
+    template_has_business_input,
+    validate_request_template,
+)
 from app.importer import build_calls, calls_to_csv, cases_for_rule
 from app.models import NORMAL, VIOLATION, normalize_label
 from app.optimizer import MockProposer, compute_gate, normalize_proposal, optimize
 from app.prompts import DEFAULT_SEMANTIC_PROMPT, render_prompt, validate_prompt
+from app.rule_importer import keyword_to_regex, parse_rule_file
 from app.seed import build_state
 from app.splits import TEST, TRAIN, VALIDATION, build_splits, split_cases
 from app.store import migrate
@@ -367,6 +379,156 @@ class ReasonTest(unittest.TestCase):
         result = asyncio.run(evaluate_rule(rule, cases, judge, with_reason=False))
         self.assertEqual(result["rows"][0]["semanticReason"], "")
         self.assertEqual(result["rows"][0]["regexReason"], "未配置正则")
+
+
+class CustomApiTest(unittest.TestCase):
+    def test_template_maps_variables(self):
+        template = json.dumps({
+            "input": {"system": "{{system}}", "user": "{{user}}"},
+            "messages": "{{messages}}",
+            "params": {"max_tokens": "{{max_tokens}}", "temperature": "{{temperature}}"},
+            "model": "{{model}}",
+        })
+        payload = build_request_payload(template, {
+            "system": "sys",
+            "user": "usr",
+            "messages": [{"role": "user", "content": "usr"}],
+            "model": "m1",
+            "apiKey": "k",
+            "max_tokens": 128,
+            "temperature": 0.0,
+        })
+        self.assertEqual(payload["input"], {"system": "sys", "user": "usr"})
+        self.assertEqual(payload["messages"], [{"role": "user", "content": "usr"}])
+        self.assertEqual(payload["params"], {"max_tokens": 128, "temperature": 0.0})
+        self.assertEqual(payload["model"], "m1")
+
+    def test_extract_path_supports_array(self):
+        data = {"data": {"items": [{"answer": "ok"}]}, "choices": [{"message": {"content": "x"}}]}
+        self.assertEqual(extract_path(data, "data.items[0].answer"), "ok")
+        self.assertEqual(extract_path(data, "data.items.0.answer"), "ok")
+        self.assertEqual(extract_path(data, "choices.0.message.content"), "x")
+
+    def test_extract_path_parses_double_encoded_result(self):
+        data = {"result": json.dumps({"finalAnswer": "ok"}, ensure_ascii=False)}
+        self.assertEqual(extract_path(data, "result.finalAnswer"), "ok")
+
+    def test_unknown_template_variable_is_rejected(self):
+        with self.assertRaises(LLMError):
+            validate_request_template('{"x": "{{unknown}}"}')
+
+    def test_custom_headers_need_api_key_only_when_used(self):
+        self.assertTrue(config_needs_api_key({"headers": [{"name": "Authorization", "value": "Bearer {{apiKey}}"}]}))
+        self.assertFalse(config_needs_api_key({"headers": [{"name": "X-Token", "value": "fixed"}]}))
+
+    def test_prompt_variable_combines_system_and_user(self):
+        client = LLMClient(
+            "http://127.0.0.1:9",
+            "m",
+            "",
+            config={"apiProtocol": "custom", "headers": [{"name": "Content-Type", "value": "application/json"}]},
+        )
+        variables = client._variables("SYS", "USR", 10, 0.0)
+        self.assertEqual(variables["prompt"], "SYS\n\nUSR")
+        payload = build_request_payload('{"question": "{{prompt}}"}', variables)
+        self.assertEqual(payload, {"question": "SYS\n\nUSR"})
+
+    def test_direct_violation_field_paths(self):
+        client = LLMClient(
+            "http://127.0.0.1:9",
+            "m",
+            "",
+            config={
+                "apiProtocol": "custom",
+                "contentPath": "result.answer",
+                "violationPath": "data.result.is_violation",
+                "reasonPath": "data.result.reason",
+            },
+        )
+        result = client._extract(
+            {"data": {"result": {"is_violation": True, "reason": "direct"}}},
+            True,
+        )
+        self.assertEqual(result, {"violation": True, "reason": "direct"})
+
+    def test_retry_counts_and_succeeds(self):
+        calls = {"count": 0}
+
+        async def handler(request):
+            calls["count"] += 1
+            if calls["count"] < 3:
+                return httpx.Response(500, text="busy")
+            return httpx.Response(200, json={"choices": [{"message": {"content": '{"ok": true}'}}]})
+
+        client = LLMClient(
+            "https://example.test",
+            "m",
+            "key",
+            config={"timeoutSec": 10, "maxRetries": 2, "retryBackoffSec": 0.2},
+        )
+        client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            result = asyncio.run(client.chat_json("s", "u", max_tokens=10))
+        finally:
+            asyncio.run(client.aclose())
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(calls["count"], 3)
+        self.assertEqual(client.stats["retries"], 2)
+        self.assertEqual(client.stats["errors"], 0)
+
+
+class SingleCallTest(unittest.TestCase):
+    def test_evaluate_semantic_calls_are_sequential(self):
+        active = {"now": 0, "max": 0}
+
+        async def judge(case, rule):
+            active["now"] += 1
+            active["max"] = max(active["max"], active["now"])
+            await asyncio.sleep(0.01)
+            active["now"] -= 1
+            return True, "ok"
+
+        cases = [
+            {"id": str(i), "callId": f"C{i}", "transcript": f"t{i}", "humanResult": VIOLATION, "autoResult": NORMAL}
+            for i in range(5)
+        ]
+        result = asyncio.run(evaluate_rule({"regex": "", "semantic": "x", "logic": "OR"}, cases, judge))
+        self.assertEqual(result["metrics"]["total"], 5)
+        self.assertEqual(active["max"], 1)
+
+
+class RuleImportTest(unittest.TestCase):
+    def test_csv_rule_file(self):
+        content = (
+            "规则编号,规则名词,关键词,规则语义,规则内容的逻辑关系\n"
+            "R005,诱导转账,转账|汇款|打款,坐席是否诱导客户转账,OR\n"
+            "R006,冒充公检法,re:(公安局|检察院|法院),坐席是否冒充公检法人员,AND\n"
+        ).encode("utf-8")
+        parsed = parse_rule_file("rules.csv", content)
+        self.assertEqual(len(parsed["rules"]), 2)
+        self.assertEqual(parsed["rules"][0]["regex"], "(?:转账|汇款|打款)")
+        self.assertEqual(parsed["rules"][0]["logic"], "OR")
+        self.assertEqual(parsed["rules"][1]["regex"], "(公安局|检察院|法院)")
+        self.assertEqual(parsed["rules"][1]["logic"], "AND")
+
+    def test_bad_row_is_reported_but_others_import(self):
+        content = (
+            "规则编号,规则名词,关键词,规则语义,规则内容的逻辑关系\n"
+            "R005,诱导转账,转账,坐席是否诱导客户转账,OR\n"
+            "BAD CODE,错规则,转账,说明,OR\n"
+        ).encode("utf-8")
+        parsed = parse_rule_file("rules.csv", content)
+        self.assertEqual(len(parsed["rules"]), 1)
+        self.assertTrue(parsed["errors"])
+
+    def test_keyword_regex_prefix(self):
+        self.assertEqual(keyword_to_regex("re:a{2,3}"), "a{2,3}")
+
+    def test_template_requires_business_input(self):
+        self.assertFalse(template_has_business_input('{"question": "{{system}}"}'))
+        self.assertTrue(template_has_business_input('{"question": "{{prompt}}"}'))
+        self.assertTrue(template_has_business_input('{"input": "{{user}}"}'))
+        self.assertTrue(template_has_business_input('{"messages": "{{messages}}"}'))
 
 
 class PromptTest(unittest.TestCase):

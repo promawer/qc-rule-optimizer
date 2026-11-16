@@ -13,7 +13,9 @@ Judge = Callable[[Dict[str, Any], Dict[str, Any]], Awaitable[Tuple[bool, str]]]
 
 
 class EvaluationError(Exception):
-    pass
+    def __init__(self, message: str, details: Optional[list] = None) -> None:
+        super().__init__(message)
+        self.details = details or []
 
 
 class JobCancelled(Exception):
@@ -84,6 +86,7 @@ async def evaluate_rule(
     cache = cache if cache is not None else {}
     total = len(cases)
     progress_state = {"done": 0, "semantic": 0, "errors": 0}
+    error_samples: List[Dict[str, str]] = []
     started = time.time()
 
     async def one(case: Dict[str, Any]) -> Dict[str, Any]:
@@ -123,7 +126,8 @@ async def evaluate_rule(
                     raise
                 except Exception as exc:  # noqa: BLE001
                     progress_state["errors"] += 1
-                    error = str(exc)[:300]
+                    error = str(exc)[:500]
+                    error_samples.append({"callId": str(case.get("callId") or ""), "error": error})
                     semantic_hit = None
             progress_state["semantic"] += 1
         semantic_reason = reason if with_reason else ""
@@ -160,14 +164,35 @@ async def evaluate_rule(
             "error": error,
         }
 
-    rows = await asyncio.gather(*(one(case) for case in cases))
+    rows = []
+    for case in cases:
+        rows.append(await one(case))
     rows = list(rows)
     needed = progress_state["semantic"]
     errors = progress_state["errors"]
     if needed and errors / max(needed, 1) > 0.1:
-        raise EvaluationError(
-            f"语义判定失败 {errors}/{needed} 条，已停止评测。请检查模型配置或网络后重试。"
+        details = error_samples[:10]
+        sample_text = "\n".join(
+            f"- {item['callId']}：{item['error'].replace(chr(10), ' ')[:300]}"
+            for item in details[:5]
         )
+        hint = "请检查模型配置、网络、超时时间、重试次数和返回字段路径。"
+        lowered = " ".join(item["error"].lower() for item in details)
+        if "超时" in lowered:
+            hint = "多数是调用超时：可以在「模型设置」中增大超时时间或重试次数。"
+        elif "http 401" in lowered or "http 403" in lowered:
+            hint = "鉴权失败：请检查 API Key 或自定义鉴权表头。"
+        elif "不是 json" in lowered or "不是有效 json" in lowered:
+            hint = "模型返回格式不对：请检查返回字段路径，以及模型是否按要求输出 JSON。"
+        elif "找不到字段" in lowered:
+            hint = "返回路径配置不对：请对照接口实际返回填写「模型文本内容」路径。"
+        elif "connection" in lowered or "connect" in lowered:
+            hint = "无法连接模型接口：请检查 Base URL、接口路径、端口和网络是否可达。"
+        message = (
+            f"语义判定失败 {errors}/{needed} 条，已停止评测。{hint}"
+            + (f"\n错误示例：\n{sample_text}" if sample_text else "")
+        )
+        raise EvaluationError(message, details=details)
     metrics = _metrics(rows)
     if metrics["total"] == 0:
         raise EvaluationError("没有可计分的样本：请确认人工复核结果包含违规和正常两类")

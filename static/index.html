@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>质检规则优化台</title>
-  <link rel="stylesheet" href="/static/style.css?v=2.1.0" />
+  <link rel="stylesheet" href="/static/style.css?v=2.6.2" />
 </head>
 <body>
   <header class="topbar">
@@ -16,7 +16,7 @@
       </div>
     </div>
     <div class="top-actions">
-      <span id="buildTag" class="muted" style="font-size:12px">v2.1</span>
+      <span id="buildTag" class="muted" style="font-size:12px">v2.6.2</span>
       <span id="modeBadge" class="badge badge-mock">模拟演示</span>
       <button id="settingsBtn" class="btn ghost" type="button">模型设置</button>
     </div>
@@ -26,12 +26,17 @@
     <aside class="sidebar">
       <div class="sidebar-head">
         <span>质检规则</span>
-        <button id="newRuleBtn" class="btn small" type="button">+ 新建</button>
+        <div class="link-row">
+          <button id="importRulesBtn" class="btn small ghost" type="button" title="导入规则文件">导入</button>
+          <button id="newRuleBtn" class="btn small" type="button">+ 新建</button>
+        </div>
       </div>
+      <input id="ruleFileInput" type="file" accept=".csv,.json,.xlsx" hidden />
       <input id="ruleSearch" class="search" placeholder="搜索规则名称" />
       <div id="ruleList" class="rule-list"></div>
       <div class="sidebar-foot">
-        每条规则由「正则」「语义」组成，按 OR / AND 组合；命中即判定违规。
+        每条规则由「正则」「语义」组成，按 OR / AND 组合；命中即判定违规。<br />
+        导入格式：规则编号、规则名词、关键词、规则语义、规则内容的逻辑关系。
       </div>
     </aside>
 
@@ -51,6 +56,7 @@
         <button class="tab" data-tab="data" type="button">2. 训练数据</button>
         <button class="tab" data-tab="optimize" type="button">3. 智能优化</button>
         <button class="tab" data-tab="prompt" type="button">4. 通用提示词</button>
+        <button class="tab" data-tab="jobs" type="button">5. 任务中心 <span id="jobsBadge" class="badge badge-live" hidden></span></button>
       </nav>
 
       <!-- ============ 规则配置 ============ -->
@@ -195,6 +201,38 @@
           </div>
         </div>
 
+        <div class="card" id="batchCard">
+          <div class="card-head">
+            <h3>批量优化</h3>
+            <span class="muted">多条或全部规则，按顺序逐条执行</span>
+          </div>
+          <p class="hint">勾选要优化的规则；批量任务会在任务中心显示，规则之间串行，模型调用不会并发。</p>
+          <div class="link-row">
+            <button id="batchAllBtn" class="btn small ghost" type="button">全选</button>
+            <button id="batchNoneBtn" class="btn small ghost" type="button">清空</button>
+            <span id="batchSelected" class="muted"></span>
+          </div>
+          <div id="batchRuleList" class="batch-rule-list"></div>
+          <div class="form-grid compact">
+            <label>
+              <span>目标准确率（%）</span>
+              <input id="batchTarget" type="number" min="50" max="100" step="1" value="90" />
+            </label>
+            <label>
+              <span>最多轮次</span>
+              <input id="batchRounds" type="number" min="1" max="10" step="1" value="5" />
+            </label>
+            <label>
+              <span>每轮最多样本</span>
+              <input id="batchSampleLimit" type="number" min="5" max="500" step="5" value="100" />
+            </label>
+          </div>
+          <div class="form-actions">
+            <button id="startBatchBtn" class="btn primary" type="button">开始批量优化</button>
+            <span id="batchStatus" class="muted"></span>
+          </div>
+        </div>
+
         <div id="jobResult"></div>
 
         <div class="card" id="casesCard" hidden>
@@ -252,23 +290,54 @@
           <div id="promptHistoryList" class="history-list"></div>
         </div>
       </div>
+
+      <!-- ============ 任务中心 ============ -->
+      <div class="tab-panel hidden" id="tab-jobs">
+        <div class="card">
+          <div class="card-head">
+            <h3>运行任务</h3>
+            <div class="link-row">
+              <span id="jobsSummary" class="muted"></span>
+              <button id="refreshJobsBtn" class="btn small ghost" type="button">刷新</button>
+            </div>
+          </div>
+          <p class="hint">
+            任务在后端持续运行，切换规则或关闭本页都不会中断。这里可以看到正在运行的任务、进度和日志。
+          </p>
+          <div id="jobsList" class="job-list"></div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h3>说明</h3></div>
+          <p class="hint">
+            同一时间只允许一个任务运行。点击「查看详情」会切到该任务所属规则并打开运行面板；
+            「取消」会请求停止任务；「日志」可查看完整请求/响应日志。
+          </p>
+        </div>
+      </div>
     </section>
   </main>
 
   <div id="toast" class="toast" hidden></div>
 
-  <dialog id="settingsDialog" class="dialog">
+  <dialog id="settingsDialog" class="dialog settings-dialog">
     <form method="dialog" class="dialog-body">
       <h3>模型设置</h3>
       <p class="hint">
-        「模拟演示」不调用任何模型，用本地启发式算法演示流程；
-        「真实模型」支持 DeepSeek 或任意 OpenAI 兼容网关。
+        「模拟演示」不调用任何模型；「真实模型」默认走 OpenAI 兼容协议。
+        如果内网接口的表头、入参或返回结构不同，把「接口协议」切成「自定义接口」后自由配置。
       </p>
       <label>
         <span>运行模式</span>
         <select id="settingMode">
           <option value="mock">模拟演示（无需 API Key）</option>
-          <option value="deepseek">真实模型（OpenAI 兼容）</option>
+          <option value="deepseek">真实模型</option>
+        </select>
+      </label>
+      <label>
+        <span>接口协议</span>
+        <select id="settingProtocol">
+          <option value="openai">OpenAI 兼容（默认）</option>
+          <option value="custom">自定义接口（表头 / 入参 / 出参可配）</option>
         </select>
       </label>
       <label>
@@ -276,13 +345,94 @@
         <input id="settingBaseUrl" placeholder="https://api.deepseek.com" />
       </label>
       <label>
-        <span>模型名</span>
+        <span>模型名 <em class="muted">自定义接口可在模板里用 {{model}}</em></span>
         <input id="settingModel" placeholder="deepseek-chat" />
       </label>
       <label>
-        <span>API Key <em class="muted">只保存在服务进程内存，不写盘</em></span>
+        <span>API Key <em class="muted">只保存在服务进程内存；自定义接口可留空或改用固定表头</em></span>
         <input id="settingApiKey" type="password" placeholder="留空表示不修改" autocomplete="off" />
       </label>
+
+      <div class="section-title">AI 调用设置</div>
+      <div class="two-col">
+        <label>
+          <span>单次超时（秒） <em class="muted">模型响应慢时调大</em></span>
+          <input id="settingTimeout" type="number" min="10" max="300" step="1" />
+        </label>
+        <label>
+          <span>失败重试次数 <em class="muted">0 表示不重试</em></span>
+          <input id="settingMaxRetries" type="number" min="0" max="10" step="1" />
+        </label>
+        <label>
+          <span>重试间隔（秒） <em class="muted">按次数递增</em></span>
+          <input id="settingRetryBackoff" type="number" min="0.2" max="30" step="0.1" />
+        </label>
+        <label>
+          <span>调用间隔（秒） <em class="muted">每次调用后至少等待这么久</em></span>
+          <input id="settingRequestInterval" type="number" min="0" max="30" step="0.1" />
+        </label>
+      </div>
+      <p class="hint">模型调用固定为单发（并发 1），逐条评测，避免触发内网接口限流。</p>
+
+      <div id="customApiFields" class="custom-api" hidden>
+        <div class="section-title">接口地址与请求</div>
+        <label>
+          <span>接口路径 <em class="muted">拼在 Base URL 后面；留空表示 Base URL 就是完整地址</em></span>
+          <input id="settingApiPath" placeholder="/chat/completions" />
+        </label>
+
+        <div class="section-title">
+          请求表头
+          <button id="addHeaderBtn" class="btn small" type="button">+ 添加表头</button>
+        </div>
+        <div id="headersTable" class="headers-table"></div>
+        <p class="hint">
+          值支持 <code>{{apiKey}}</code>、<code>{{model}}</code> 等变量。敏感 token 建议写成
+          <code>Bearer {{apiKey}}</code>，这样只保存在内存，不写入 data\store.json。
+        </p>
+
+        <div class="section-title">请求体模板（JSON）</div>
+        <textarea id="settingRequestTemplate" rows="9" spellcheck="false"></textarea>
+        <p class="hint">
+          可用变量：<code>{{prompt}}</code> 完整提示词（系统+业务，单入参接口直接用这个）、
+          <code>{{system}}</code> 系统提示词、<code>{{user}}</code> 用户提示词、
+          <code>{{messages}}</code> 消息数组、<code>{{model}}</code>、<code>{{apiKey}}</code>、
+          <code>{{requestId}}</code> 每次调用唯一 ID、<code>{{max_tokens}}</code>、<code>{{temperature}}</code>。
+          占位符必须放在 JSON 字符串里，例如 <code>"input": "{{user}}"</code>；
+          整个值只写一个占位符时，会替换成对应类型（数组/数字）。
+        </p>
+        <p class="hint">
+          <b>单入参接口：</b>点「单入参 question 模板」会填入本机
+          <code>local-defaults.json</code> 中的地址、路径、userId（未配置时使用占位值），
+          以及 <code>Content-Type / token / userId</code> 表头、
+          <code>{"question": "{{prompt}}", "sessionId": "testuuid"}</code>
+          和返回路径 <code>result.finalAnswer</code>。token 保留原值，不会被覆盖。
+        </p>
+        <div class="form-actions">
+          <button id="presetQuestionBtn" class="btn ghost small" type="button">单入参 question 模板</button>
+          <button id="resetCustomBtn" class="btn ghost small" type="button">填入 OpenAI 默认模板</button>
+          <span class="muted">切换协议不会自动改模板</span>
+        </div>
+
+        <div class="section-title">返回字段路径</div>
+        <label>
+          <span>模型文本内容 <em class="muted">必填，例：choices.0.message.content</em></span>
+          <input id="settingContentPath" placeholder="choices.0.message.content" />
+        </label>
+        <label>
+          <span>违规布尔字段 <em class="muted">可选；填了就直接读取，不再解析文本 JSON</em></span>
+          <input id="settingViolationPath" placeholder="例如 data.result.is_violation" />
+        </label>
+        <label>
+          <span>理由字段 <em class="muted">可选，配合上一项使用</em></span>
+          <input id="settingReasonPath" placeholder="例如 data.result.reason" />
+        </label>
+        <p class="hint">
+          路径用点号分隔，支持数组下标：<code>data.items[0].answer</code>、
+          <code>choices.0.message.content</code>。
+        </p>
+      </div>
+
       <div id="settingsStatus" class="muted"></div>
       <div class="dialog-actions">
         <button id="testConnBtn" class="btn ghost" type="button">测试连接</button>
@@ -292,6 +442,6 @@
     </form>
   </dialog>
 
-  <script src="/static/app.js?v=2.1.0"></script>
+  <script src="/static/app.js?v=2.6.2"></script>
 </body>
 </html>

@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 import re
-from typing import Dict, Literal, Optional
+from typing import Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, root_validator
 
 VIOLATION = "VIOLATION"
 NORMAL = "NORMAL"
@@ -46,30 +46,43 @@ class RuleInput(BaseModel):
     logic: Literal["OR", "AND"] = "OR"
     changeReason: str = Field(default="", max_length=500)
 
-    @model_validator(mode="after")
-    def _validate_content(self) -> "RuleInput":
-        self.code = self.code.strip().upper()
-        self.name = self.name.strip()
-        self.description = self.description.strip()
-        self.regex = self.regex.strip()
-        self.semantic = self.semantic.strip()
-        self.changeReason = self.changeReason.strip()
-        if not re.fullmatch(r"[A-Z0-9][A-Z0-9_.\-]{0,19}", self.code):
+    @root_validator
+    def _validate_content(cls, values: Dict[str, object]) -> Dict[str, object]:
+        for key in ("code", "name", "description", "regex", "semantic", "changeReason"):
+            values[key] = str(values.get(key) or "").strip()
+        values["code"] = str(values["code"]).upper()
+        if not re.fullmatch(r"[A-Z0-9][A-Z0-9_.\-]{0,19}", str(values["code"])):
             raise ValueError("规则编号只能包含字母、数字、下划线、短横线或点，且以字母或数字开头")
-        if not self.regex and not self.semantic:
+        if not values["regex"] and not values["semantic"]:
             raise ValueError("正则表达式和语义描述至少填写一项")
-        if self.regex:
+        if values["regex"]:
             try:
-                re.compile(self.regex)
+                re.compile(str(values["regex"]))
             except re.error as exc:
                 raise ValueError(f"正则表达式无法编译：{exc}") from exc
-        return self
+        return values
+
+
+class HeaderInput(BaseModel):
+    name: str = Field(default="", max_length=100)
+    value: str = Field(default="", max_length=2000)
 
 
 class SettingsInput(BaseModel):
     mode: Literal["mock", "deepseek"] = "mock"
-    baseUrl: str = Field(default="https://api.deepseek.com", max_length=300)
+    apiProtocol: Literal["openai", "custom"] = "openai"
+    baseUrl: str = Field(default="https://api.deepseek.com", max_length=500)
+    apiPath: str = Field(default="/chat/completions", max_length=500)
     model: str = Field(default="deepseek-chat", max_length=100)
+    headers: List[HeaderInput] = Field(default_factory=list)
+    requestTemplate: str = Field(default="", max_length=20000)
+    contentPath: str = Field(default="choices.0.message.content", max_length=300)
+    violationPath: str = Field(default="", max_length=300)
+    reasonPath: str = Field(default="", max_length=300)
+    timeoutSec: int = Field(default=90, ge=10, le=300)
+    maxRetries: int = Field(default=3, ge=0, le=10)
+    retryBackoffSec: float = Field(default=1.5, ge=0.2, le=30)
+    requestIntervalSec: float = Field(default=0.5, ge=0, le=30)
     apiKey: Optional[str] = Field(default=None, max_length=500)
 
 
@@ -80,6 +93,13 @@ class PromptInput(BaseModel):
 
 class OptimizeInput(BaseModel):
     ruleId: str
+    targetAccuracy: float = Field(default=0.9, ge=0.5, le=1.0)
+    maxRounds: int = Field(default=5, ge=1, le=10)
+    sampleLimit: int = Field(default=100, ge=5, le=500)
+
+
+class BatchOptimizeInput(BaseModel):
+    ruleIds: List[str] = Field(default_factory=list)
     targetAccuracy: float = Field(default=0.9, ge=0.5, le=1.0)
     maxRounds: int = Field(default=5, ge=1, le=10)
     sampleLimit: int = Field(default=100, ge=5, le=500)

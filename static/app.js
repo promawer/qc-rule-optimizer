@@ -3,7 +3,7 @@
 
   const $ = (selector) => document.querySelector(selector);
   const $$ = (selector) => Array.from(document.querySelectorAll(selector));
-  const TERMINAL = new Set(["reached", "exhausted", "failed", "cancelled", "evaluated"]);
+  const TERMINAL = new Set(["reached", "exhausted", "failed", "cancelled", "evaluated", "batch_done"]);
 
   const state = {
     rules: [],
@@ -19,6 +19,10 @@
     caseSplit: "TRAIN",
     caseWithReason: true,
     prompt: null,
+    jobs: [],
+    jobsTimer: null,
+    batchSelected: null,
+    localDefaults: {},
     activeTab: "rule",
   };
 
@@ -73,6 +77,8 @@
     cancelled: ["已取消", ""],
     failed: ["失败", "badge-fail"],
     evaluated: ["已评测", "badge-ok"],
+    batch_done: ["批量完成", "badge-ok"],
+    skipped: ["已跳过", "badge-mock"],
   };
 
   function statusInfo(status) {
@@ -156,13 +162,16 @@
     await loadSettings();
     await loadRules();
     await loadPrompt();
+    state.localDefaults = await api("/api/client-defaults").catch(() => ({}));
     if (state.rules.length) {
       await selectRule(state.rules[0].id);
     } else {
       clearRuleForm();
     }
     const initial = location.hash.replace("#", "");
-    if (["rule", "data", "optimize", "prompt"].includes(initial)) setTab(initial);
+    if (["rule", "data", "optimize", "prompt", "jobs"].includes(initial)) setTab(initial);
+    await loadJobs().catch(() => {});
+    scheduleJobsRefresh(5000);
   }
 
   function bindEvents() {
@@ -170,6 +179,24 @@
     $("#closeSettingsBtn").addEventListener("click", () => $("#settingsDialog").close());
     $("#saveSettingsBtn").addEventListener("click", saveSettings);
     $("#testConnBtn").addEventListener("click", testConnection);
+    $("#settingProtocol").addEventListener("change", toggleProtocolFields);
+    $("#addHeaderBtn").addEventListener("click", () => addHeaderRow());
+    $("#headersTable").addEventListener("click", (event) => {
+      const button = event.target.closest(".remove-header");
+      if (button) button.closest(".header-row").remove();
+    });
+    $("#resetCustomBtn").addEventListener("click", resetCustomDefaults);
+    $("#presetQuestionBtn").addEventListener("click", applySingleInputPreset);
+    $("#refreshJobsBtn").addEventListener("click", () => loadJobs().catch((error) => toast(error.message, "error")));
+    $("#jobsList").addEventListener("click", (event) => {
+      const open = event.target.closest("[data-job-open]");
+      if (open) {
+        openJob(open.dataset.jobOpen);
+        return;
+      }
+      const cancel = event.target.closest("[data-job-cancel]");
+      if (cancel) cancelJobById(cancel.dataset.jobCancel);
+    });
 
     $("#newRuleBtn").addEventListener("click", () => {
       if (state.dirty && !confirm("当前修改尚未保存，仍要新建规则吗？")) return;
@@ -177,17 +204,37 @@
       setTab("rule");
       $("#ruleName").focus();
     });
+    $("#importRulesBtn").addEventListener("click", () => $("#ruleFileInput").click());
+    $("#ruleFileInput").addEventListener("change", importRuleFile);
     $("#ruleSearch").addEventListener("input", renderRuleList);
 
     window.addEventListener("hashchange", () => {
       const tab = location.hash.replace("#", "");
-      if (["rule", "data", "optimize"].includes(tab) && tab !== state.activeTab) setTab(tab);
+      if (["rule", "data", "optimize", "prompt", "jobs"].includes(tab) && tab !== state.activeTab) setTab(tab);
     });
 
     $("#tabs").addEventListener("click", (event) => {
       const tab = event.target.closest(".tab");
       if (tab) setTab(tab.dataset.tab);
     });
+
+    $("#batchAllBtn").addEventListener("click", () => {
+      state.batchSelected = new Set(state.rules.map((rule) => rule.id));
+      renderBatchRules();
+    });
+    $("#batchNoneBtn").addEventListener("click", () => {
+      state.batchSelected = new Set();
+      renderBatchRules();
+    });
+    $("#batchRuleList").addEventListener("change", (event) => {
+      const input = event.target.closest("[data-batch-rule]");
+      if (!input) return;
+      if (!state.batchSelected) state.batchSelected = new Set();
+      if (input.checked) state.batchSelected.add(input.dataset.batchRule);
+      else state.batchSelected.delete(input.dataset.batchRule);
+      updateBatchSelected();
+    });
+    $("#startBatchBtn").addEventListener("click", startBatch);
 
     $("#saveRuleBtn").addEventListener("click", saveRule);
     $("#testRegexBtn").addEventListener("click", testRegex);
@@ -214,7 +261,20 @@
 
     $("#jobResult").addEventListener("click", (event) => {
       const button = event.target.closest("[data-apply]");
-      if (button) applyRun(button.dataset.apply, button);
+      if (button) {
+        applyRun(button.dataset.apply, button);
+        return;
+      }
+      const iterButton = event.target.closest("[data-iter-cases]");
+      if (iterButton) {
+        const area = iterButton.closest(".iteration-cases").querySelector("[data-iter-area]");
+        loadIterationCases(
+          iterButton.dataset.iterCases,
+          iterButton.dataset.iterIndex,
+          iterButton.dataset.iterSplit,
+          area
+        );
+      }
     });
     $("#jobResult").addEventListener("change", (event) => {
       if (event.target.id === "applyForce") {
@@ -254,8 +314,9 @@
       });
     });
 
-    $("#settingsDialog").addEventListener("click", (event) => {
-      if (event.target === $("#settingsDialog")) $("#settingsDialog").close();
+    $("#settingsDialog").addEventListener("cancel", (event) => {
+      // 避免按 Esc 或误点遮罩把正在编辑的配置关掉；只通过“关闭”按钮退出。
+      event.preventDefault();
     });
   }
 
@@ -263,10 +324,70 @@
   async function loadRules() {
     state.rules = await api("/api/rules");
     renderRuleList();
+    renderBatchRules();
     if (state.currentId) {
       const rule = state.rules.find((item) => item.id === state.currentId);
       if (rule) renderRuleHeader(rule);
       else clearRuleForm();
+    }
+  }
+
+  function batchSelection() {
+    const valid = new Set(state.rules.map((rule) => rule.id));
+    if (!state.batchSelected) state.batchSelected = new Set(valid);
+    state.batchSelected = new Set([...state.batchSelected].filter((id) => valid.has(id)));
+    return state.batchSelected;
+  }
+
+  function renderBatchRules() {
+    const selected = batchSelection();
+    $("#batchRuleList").innerHTML = state.rules.map((rule) => `
+      <label class="batch-rule">
+        <input type="checkbox" data-batch-rule="${esc(rule.id)}" ${selected.has(rule.id) ? "checked" : ""} />
+        <span class="mono">${esc(rule.code)}</span>
+        <span>${esc(rule.name)}</span>
+      </label>`).join("") || '<div class="empty">还没有规则</div>';
+    updateBatchSelected();
+  }
+
+  function updateBatchSelected() {
+    const selected = batchSelection();
+    $("#batchSelected").textContent = `已选 ${selected.size} / ${state.rules.length} 条`;
+  }
+
+  async function startBatch() {
+    const selected = [...batchSelection()];
+    if (!selected.length) return toast("请至少勾选一条规则", "error");
+    const targetPct = Number($("#batchTarget").value);
+    const maxRounds = Number($("#batchRounds").value);
+    const sampleLimit = Number($("#batchSampleLimit").value);
+    if (!(targetPct >= 50 && targetPct <= 100)) return toast("目标准确率需在 50% 到 100% 之间", "error");
+    if (!(maxRounds >= 1 && maxRounds <= 10)) return toast("轮次需在 1 到 10 之间", "error");
+    if (state.job && ["queued", "running"].includes(state.job.status)) return toast("已有任务正在运行", "error");
+    const ok = confirm(`将按顺序优化 ${selected.length} 条规则，模型调用为单发串行。继续吗？`);
+    if (!ok) return;
+    $("#startBatchBtn").disabled = true;
+    $("#batchStatus").textContent = "正在创建批量任务…";
+    try {
+      const data = await api("/api/optimize/batch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ruleIds: selected,
+          targetAccuracy: targetPct / 100,
+          maxRounds,
+          sampleLimit,
+        }),
+      });
+      $("#batchStatus").textContent = "";
+      toast("批量优化任务已创建", "success");
+      await loadJobs();
+      setTab("jobs");
+    } catch (error) {
+      $("#batchStatus").textContent = error.message;
+      toast(error.message, "error");
+    } finally {
+      $("#startBatchBtn").disabled = false;
     }
   }
 
@@ -332,7 +453,7 @@
       return;
     }
     card.hidden = false;
-    const sourceLabel = { manual: "人工修改", optimize: "优化应用" };
+    const sourceLabel = { manual: "人工修改", optimize: "优化应用", import: "规则文件导入" };
     const fieldLabel = {
       code: "编号", name: "名称", description: "说明",
       regex: "正则", semantic: "语义", logic: "逻辑",
@@ -389,6 +510,40 @@
     $("#casesCard").hidden = true;
     $("#historyCard").hidden = true;
     setTab("rule");
+  }
+
+  async function importRuleFile(event) {
+    const input = event.target;
+    const file = input.files && input.files[0];
+    input.value = "";
+    if (!file) return;
+    if (state.dirty && !confirm("当前规则有未保存修改，仍要导入规则文件吗？")) return;
+    const confirmed = confirm(
+      `按规则编号合并导入「${file.name}」？\n` +
+      "同名规则会更新，文件里没有的规则保持不动。"
+    );
+    if (!confirmed) return;
+    const form = new FormData();
+    form.append("file", file);
+    try {
+      const result = await api("/api/rules/import", { method: "POST", body: form });
+      await loadRules();
+      const firstCode = result.codes && result.codes[0];
+      const firstRule = firstCode ? state.rules.find((rule) => rule.code === firstCode) : null;
+      if (firstRule) await selectRule(firstRule.id);
+      toast(
+        `规则导入完成：新建 ${result.created}，更新 ${result.updated}，未变化 ${result.skipped}`,
+        "success"
+      );
+      if (result.errors && result.errors.length) {
+        alert("以下行未导入：\n" + result.errors.join("\n"));
+      }
+      if (result.warnings && result.warnings.length) {
+        alert("导入提示：\n" + result.warnings.join("\n"));
+      }
+    } catch (error) {
+      toast(error.message, "error");
+    }
   }
 
   async function saveRule() {
@@ -495,7 +650,7 @@
       stat("通话总数", calls),
       stat(`本规则违规（${data.ruleCode || ""}）`, labels.VIOLATION || 0, "red"),
       stat("本规则正常", labels.NORMAL || 0, "green"),
-      stat("自动质检准确率", data.autoAccuracy == null ? "—" : pct(data.autoAccuracy), "blue"),
+      stat("本规则自动准确率", data.autoAccuracy == null ? "—" : pct(data.autoAccuracy), "blue"),
     ].join("");
     $("#datasetCount").textContent = `共 ${calls} 通通话；${splitText}；当前规则派生 ${data.total} 个样本${data.rows.length < data.total ? `（显示前 ${data.rows.length} 条）` : ""}`;
     $("#exportLink").hidden = calls === 0;
@@ -511,7 +666,7 @@
     };
     const splitLabel = { TRAIN: "训练", VALIDATION: "验证", TEST: "测试" };
     $("#datasetTable").innerHTML = `<table>
-      <thead><tr><th>通话ID</th><th>集合</th><th>本规则人工</th><th>本规则自动</th><th>自动是否正确</th><th>人工违规规则</th><th>自动违规规则</th><th>通话文本</th></tr></thead>
+      <thead><tr><th>通话ID</th><th>集合</th><th>本规则人工</th><th>本规则自动</th><th>本规则自动正确？</th><th>人工违规规则</th><th>自动违规规则</th><th>通话文本</th></tr></thead>
       <tbody>${data.rows.map((row) => {
         const autoCorrect = row.autoResult === row.humanResult;
         return `<tr class="clickable">
@@ -524,7 +679,12 @@
           <td class="mono">${codeText(row.autoRules)}</td>
           <td class="transcript">${transcriptBlock(row.transcript)}</td>
         </tr>`;
-      }).join("")}</tbody></table>`;
+      }).join("")}</tbody></table>
+      <p class="hint">
+        「本规则人工 / 本规则自动」只看当前规则编号是否出现在人工/自动违规规则中；
+        「本规则自动正确？」比较的也是当前这一条规则，不是两份全部规则列表是否完全相等。
+        右侧两列展示整通电话的全部规则，其他规则的差异不影响本规则样本。
+      </p>`;
   }
 
   async function uploadDataset() {
@@ -603,7 +763,7 @@
   function setTab(name) {
     state.activeTab = name;
     $$("#tabs .tab").forEach((tab) => tab.classList.toggle("active", tab.dataset.tab === name));
-    ["rule", "data", "optimize", "prompt"].forEach((key) => {
+    ["rule", "data", "optimize", "prompt", "jobs"].forEach((key) => {
       $(`#tab-${key}`).classList.toggle("hidden", key !== name);
     });
     if (location.hash !== `#${name}`) history.replaceState(null, "", `#${name}`);
@@ -613,6 +773,10 @@
       loadRuns().catch(() => {});
     }
     if (name === "prompt") loadPrompt().catch((error) => toast(error.message, "error"));
+    if (name === "jobs") {
+      loadJobs().catch((error) => toast(error.message, "error"));
+      scheduleJobsRefresh(800);
+    }
   }
 
   function updateOptimizeHint() {
@@ -626,8 +790,8 @@
       hint.textContent = `当前只有 ${total} 通通话，至少需要 5 通（且人工列中要同时出现违规和正常）。`;
       return;
     }
-    if (state.settings && state.settings.mode === "deepseek" && !state.settings.hasApiKey) {
-      hint.textContent = "真实模型模式尚未配置 API Key，请先在「模型设置」中填写。";
+    if (state.settings && state.settings.mode === "deepseek" && state.settings.requiresApiKey && !state.settings.hasApiKey) {
+      hint.textContent = "当前接口需要 API Key，请先在「模型设置」中填写；自定义接口用固定表头鉴权时可以留空。";
       return;
     }
     if (state.settings && state.settings.mode === "mock") {
@@ -671,6 +835,7 @@
           });
       state.jobId = data.jobId;
       pollJob(data.jobId);
+      loadJobs().catch(() => {});
     } catch (error) {
       $("#startBtn").disabled = false;
       $("#evaluateBtn").disabled = false;
@@ -704,6 +869,7 @@
       if (job.hasCases) await loadJobCases(jobId);
       await loadRuns();
       await loadRules();
+      await loadJobs().catch(() => {});
     } catch (error) {
       $("#startBtn").disabled = false;
       $("#evaluateBtn").disabled = false;
@@ -716,6 +882,131 @@
     try {
       await api(`/api/jobs/${state.jobId}/cancel`, { method: "POST" });
       toast("已请求取消");
+    } catch (error) {
+      toast(error.message, "error");
+    }
+  }
+
+  function updateJobsBadge(running) {
+    const badge = $("#jobsBadge");
+    if (!badge) return;
+    badge.hidden = !running;
+    badge.textContent = running ? String(running) : "";
+  }
+
+  async function loadJobs() {
+    const data = await api("/api/jobs");
+    state.jobs = data.jobs || [];
+    updateJobsBadge(data.running || 0);
+    if (state.activeTab === "jobs") renderJobs();
+  }
+
+  function scheduleJobsRefresh(delay) {
+    clearTimeout(state.jobsTimer);
+    state.jobsTimer = setTimeout(async () => {
+      await loadJobs().catch(() => {});
+      scheduleJobsRefresh(state.activeTab === "jobs" ? 1500 : 5000);
+    }, delay);
+  }
+
+  function renderJobs() {
+    const jobs = state.jobs || [];
+    const running = jobs.filter((job) => ["queued", "running"].includes(job.status)).length;
+    $("#jobsSummary").textContent = `运行中 ${running} 个 / 共 ${jobs.length} 个`;
+    if (!jobs.length) {
+      $("#jobsList").innerHTML = '<div class="empty">还没有任务。回到「智能优化」开始一次优化或评测。</div>';
+      return;
+    }
+    $("#jobsList").innerHTML = jobs.map((job) => {
+      const info = statusInfo(job.status);
+      const active = ["queued", "running"].includes(job.status);
+      const progress = job.progress || {};
+      const done = progress.done || 0;
+      const total = progress.total || 0;
+      const percent = active ? (total ? Math.min(100, (done / total) * 100) : 0) : 100;
+      const kind = job.kind === "batch" ? "批量优化" : job.kind === "optimize" ? "优化" : "评测";
+      const stats = job.llmStats || {};
+      const results = job.ruleResults || [];
+      const batchResults = results.map((item) => {
+        const itemInfo = statusInfo(item.status);
+        const gate = item.gate ? `验收 ${item.gate}` : "";
+        const metrics = item.bestValidation != null
+          ? `验证 ${pct(item.bestValidation)} / 测试 ${pct(item.bestTest)}`
+          : "";
+        return `<div class="batch-result-row">
+          <span class="badge ${itemInfo.cls}">${esc(itemInfo.text)}</span>
+          <span class="mono">${esc(item.ruleCode || "")}</span>
+          <span>${esc(item.ruleName || "")}</span>
+          <span class="muted">${esc(metrics)} ${esc(gate)}</span>
+          ${item.error ? `<span class="job-error">${esc(String(item.error).slice(0, 160))}</span>` : ""}
+          ${item.jobId ? `<button class="btn small ghost" type="button" data-job-open="${esc(item.jobId)}">查看结果</button>` : ""}
+        </div>`;
+      }).join("");
+      const error = job.error
+        ? `<div class="job-error">${esc(String(job.error).slice(0, 300))}</div>`
+        : "";
+      return `<div class="job-card ${active ? "job-card-active" : ""}">
+        <div class="job-card-head">
+          <span class="badge ${info.cls}">${esc(info.text)}</span>
+          <b>${job.kind === "batch" ? "批量优化" : `${esc(job.ruleCode || "")} ${esc(job.ruleName || "")}`}</b>
+          <span class="muted">${kind} · ${esc(job.id)}</span>
+        </div>
+        <div class="job-card-phase">
+          <span>${esc(job.phase || "准备中")}</span>
+          <span>${active ? `${done} / ${total || "?"}` : "已完成"}</span>
+        </div>
+        <div class="progress"><div style="width:${percent}%"></div></div>
+        <div class="job-card-meta">
+          创建 ${esc(fmtTime(job.createdAt))}
+          · 耗时 ${esc(elapsedText(job) || "—")}
+          · 模型调用 ${stats.calls || 0} 次 / 重试 ${stats.retries || 0} 次
+          ${job.sampleCount ? ` · 样本 ${job.sampleCount}` : ""}
+        </div>
+        ${batchResults ? `<div class="batch-results">${batchResults}</div>` : ""}
+        ${error}
+        <div class="job-card-actions">
+          ${job.kind === "batch" ? "" : `<button class="btn small" type="button" data-job-open="${esc(job.id)}">查看详情</button>`}
+          ${active ? `<button class="btn small ghost" type="button" data-job-cancel="${esc(job.id)}">取消</button>` : ""}
+          <a class="btn small ghost" href="/api/jobs/${encodeURIComponent(job.id)}/log" target="_blank" rel="noopener">日志</a>
+        </div>
+      </div>`;
+    }).join("");
+  }
+
+  async function openJob(jobId) {
+    try {
+      const job = await api(`/api/jobs/${jobId}`);
+      if (job.kind === "batch") {
+        setTab("jobs");
+        return;
+      }
+      const rule = state.rules.find((item) => item.id === job.ruleId);
+      if (!rule) {
+        toast("任务所属规则已不存在，只能查看日志", "error");
+        return;
+      }
+      if (state.currentId !== job.ruleId) await selectRule(job.ruleId);
+      setTab("optimize");
+      state.job = job;
+      state.jobId = job.id;
+      renderJob(job);
+      if (!TERMINAL.has(job.status)) {
+        pollJob(job.id);
+      } else if (job.hasCases) {
+        await loadJobCases(job.id);
+      }
+      loadJobs().catch(() => {});
+    } catch (error) {
+      toast(error.message, "error");
+    }
+  }
+
+  async function cancelJobById(jobId) {
+    if (!confirm("确定取消这个任务吗？")) return;
+    try {
+      await api(`/api/jobs/${jobId}/cancel`, { method: "POST" });
+      toast("已请求取消");
+      await loadJobs();
     } catch (error) {
       toast(error.message, "error");
     }
@@ -785,10 +1076,76 @@
     </div>`;
   }
 
+  function renderFlow(job) {
+    const phase = job.phase || "";
+    const steps = [];
+    const add = (label, active, done) => steps.push({ label, active: Boolean(active), done: Boolean(done) });
+    if (job.kind === "evaluate") {
+      add("训练集评测", phase.includes("评测 训练集"), Boolean(job.baseline));
+      add("验证集评测", phase.includes("评测 验证集"), Boolean(job.baselineValidation));
+      add("测试集评测", phase.includes("评测 测试集"), Boolean(job.bestTest));
+    } else {
+      add("基线·训练集", phase.includes("基线评测（训练集") && !job.baseline, Boolean(job.baseline));
+      add("基线·验证集", phase.includes("基线评测（验证集"), Boolean(job.baselineValidation));
+      (job.iterations || []).forEach((iteration, index) => {
+        const round = index + 1;
+        add(`第 ${round} 轮·规则改写`, phase.includes(`第 ${round} 轮：生成`), true);
+        add(`第 ${round} 轮·训练评测`, phase.includes(`第 ${round} 轮：训练`), true);
+        add(`第 ${round} 轮·验证评测`, phase.includes(`第 ${round} 轮：验证`), true);
+      });
+      add("测试集验收", phase.includes("测试集最终验收"), Boolean(job.bestTest));
+    }
+
+    let current = steps.findIndex((step) => step.active);
+    if (current < 0) current = steps.findIndex((step) => !step.done);
+    const chips = steps.map((step, index) => {
+      const cls = step.done ? "done" : index === current ? "active" : "pending";
+      return `<span class="flow-step ${cls}">${esc(step.label)}</span>`;
+    }).join("");
+    const stats = job.llmStats || {};
+    const statsText = stats.calls
+      ? `模型调用 ${stats.calls} 次，尝试 ${stats.attempts} 次，重试 ${stats.retries} 次，失败 ${stats.errors} 次`
+      : "尚未产生模型调用";
+    return `<div class="card flow-card">
+      <div class="card-head"><h3>AI 调用流程</h3><span class="muted">${esc(job.phase || "准备中")}</span></div>
+      <div class="flow">${chips || '<span class="muted">准备中</span>'}</div>
+      <div class="flow-stats">${esc(statsText)}</div>
+    </div>`;
+  }
+
+  function renderErrorCard(job) {
+    if (!job.error) return "";
+    const details = (job.errorDetails || []).map((item) => (
+      `<div class="error-detail"><b>${esc(item.callId || "-")}</b>：${esc(item.error || "")}</div>`
+    )).join("");
+    return `<div class="card error-card">
+      <div class="card-head"><h3>任务失败</h3><span class="badge badge-fail">失败</span></div>
+      <pre class="error-text">${esc(job.error)}</pre>
+      ${details ? `<div class="error-details"><div class="section-title">失败样本</div>${details}</div>` : ""}
+    </div>`;
+  }
+
+  function renderJobLogs(job) {
+    const logs = (job.logs || []).slice(-120);
+    const lines = logs.map((item) => {
+      const level = item.level === "error" ? "error" : "";
+      return `<div class="log-line ${level}">${timeOnly(item.at)}  ${esc(item.message)}</div>`;
+    }).join("");
+    return `<div class="card log-card">
+      <div class="card-head">
+        <h3>运行日志</h3>
+        <a class="btn small ghost" href="/api/jobs/${encodeURIComponent(job.id)}/log" target="_blank" rel="noopener">查看完整日志</a>
+      </div>
+      <p class="hint">这里显示调用摘要；完整大模型入参/出参在下载日志中，Authorization/token 等敏感表头已脱敏。</p>
+      <div class="log-lines">${lines || '<div class="muted">暂无日志</div>'}</div>
+    </div>`;
+  }
+
   function renderJobResult(job) {
     const container = $("#jobResult");
+    let html = renderFlow(job) + renderErrorCard(job) + renderJobLogs(job);
     if (!job.baseline) {
-      container.innerHTML = job.error ? `<div class="card"><p class="muted">${esc(job.error)}</p></div>` : "";
+      container.innerHTML = html;
       return;
     }
     const baselineTrain = job.baseline;
@@ -802,7 +1159,6 @@
     const gap = Math.abs((bestValidation.accuracy || 0) - (bestTest.accuracy || 0));
     const gate = job.gate;
 
-    let html = "";
     if (gate) html += renderGate(gate);
 
     const splitRows = [
@@ -916,6 +1272,12 @@
         ${iteration.expectedEffect ? `<div class="expected">预期效果：${esc(iteration.expectedEffect)}</div>` : ""}
         <div class="compare">${compareBox("修改前", before)}${compareBox("修改后", after)}</div>
         ${promptBlock}
+        <div class="iteration-cases">
+          <button class="btn small ghost" type="button" data-iter-cases="${esc(job.id)}" data-iter-index="${iteration.index}" data-iter-split="TRAIN">训练集逐条结果</button>
+          <button class="btn small ghost" type="button" data-iter-cases="${esc(job.id)}" data-iter-index="${iteration.index}" data-iter-split="VALIDATION">验证集逐条结果</button>
+          <span class="muted">训练集含正则+语义理由；验证集仅正则理由；测试集只在最终验收评测</span>
+          <div class="iteration-cases-area" data-iter-area="${iteration.index}"></div>
+        </div>
         <div class="chip-row">
           <span class="chip">验证精确率 ${pct(validation.precision)}</span>
           <span class="chip">验证召回率 ${pct(validation.recall)}</span>
@@ -925,6 +1287,47 @@
         </div>
       </div>`;
     }).join("");
+  }
+
+  async function loadIterationCases(jobId, index, split, area) {
+    if (!area) return;
+    area.innerHTML = '<div class="muted">正在加载逐条结果…</div>';
+    try {
+      const data = await api(`/api/jobs/${encodeURIComponent(jobId)}/iterations/${index}/cases?split=${split}`);
+      const rows = data.rows || [];
+      if (!rows.length) {
+        area.innerHTML = '<div class="empty small">该轮没有逐条结果</div>';
+        return;
+      }
+      const label = split === "TRAIN" ? "训练集" : "验证集";
+      area.innerHTML = `<div class="iteration-cases-head">${label} ${rows.length} 条，验证集不生成语义理由（仅正则）</div>
+        <div class="table-wrap"><table>
+          <thead><tr><th>通话ID</th><th>人工</th><th>本规则判定</th><th>结果</th><th>正则理由</th><th>语义理由</th><th>通话文本</th></tr></thead>
+          <tbody>${rows.map((row) => {
+            const result = row.predicted == null
+              ? '<span class="pill pill-u">未判定</span>'
+              : row.correct
+                ? '<span class="pill pill-ok">正确</span>'
+                : '<span class="pill pill-bad">错误</span>';
+            const regexReason = row.regexReason
+              || (row.regexHit === true ? "正则命中" : row.regexHit === false ? "正则未命中" : "未配置正则");
+            let semanticReason = row.semanticReason || "";
+            if (!data.withReason) semanticReason = "未生成（仅正则）";
+            else if (!semanticReason) semanticReason = row.semanticHit == null ? "未调用语义" : "未生成";
+            return `<tr class="clickable">
+              <td class="mono">${esc(row.callId)}</td>
+              <td>${labelPill(row.humanResult)}</td>
+              <td>${predPill(row.predicted)}</td>
+              <td>${result}</td>
+              <td class="reason-cell">${esc(regexReason)}</td>
+              <td class="reason-cell">${esc(semanticReason)}</td>
+              <td class="transcript">${transcriptBlock(row.transcript)}</td>
+            </tr>`;
+          }).join("")}</tbody>
+        </table></div>`;
+    } catch (error) {
+      area.innerHTML = `<div class="job-error">${esc(error.message)}</div>`;
+    }
   }
 
   async function loadJobCases(jobId) {
@@ -1033,36 +1436,175 @@
   }
 
   // ---------------------------------------------------------------- 设置
+  const FALLBACK_TEMPLATE = '{\n  "model": "{{model}}",\n  "messages": "{{messages}}",\n  "temperature": "{{temperature}}",\n  "max_tokens": "{{max_tokens}}"\n}';
+  const FALLBACK_SINGLE_TEMPLATE = '{\n  "question": "{{prompt}}",\n  "sessionId": "testuuid"\n}';
+  const FALLBACK_HEADERS = [
+    { name: "Content-Type", value: "application/json" },
+    { name: "Authorization", value: "Bearer {{apiKey}}" },
+  ];
+
+  function defaultHeaders() {
+    const fromServer = state.settings && state.settings.defaultHeaders;
+    return Array.isArray(fromServer) && fromServer.length ? fromServer : FALLBACK_HEADERS;
+  }
+
   async function loadSettings() {
     state.settings = await api("/api/settings");
     renderMode();
   }
 
   function renderMode() {
-    const mode = (state.settings && state.settings.mode) || "mock";
+    const settings = state.settings || {};
+    const mode = settings.mode || "mock";
+    const custom = mode === "deepseek" && settings.apiProtocol === "custom";
     const badge = $("#modeBadge");
-    badge.textContent = mode === "deepseek" ? "真实模型" : "模拟演示";
+    badge.textContent = mode === "deepseek" ? (custom ? "自定义接口" : "真实模型") : "模拟演示";
     badge.className = `badge ${mode === "deepseek" ? "badge-live" : "badge-mock"}`;
+  }
+
+  function renderHeaderRows(headers) {
+    const rows = Array.isArray(headers) ? headers : [];
+    $("#headersTable").innerHTML = rows.length
+      ? rows.map((item) => `
+        <div class="header-row">
+          <input class="header-name" placeholder="Header 名称" value="${esc(item.name || "")}" />
+          <input class="header-value" placeholder="值，例如 Bearer {{apiKey}}" value="${esc(item.value || "")}" />
+          <button class="btn small ghost remove-header" type="button">删除</button>
+        </div>`).join("")
+      : '<div class="empty small">还没有表头，点击“添加表头”</div>';
+  }
+
+  function collectHeaders() {
+    return $$("#headersTable .header-row").map((row) => ({
+      name: row.querySelector(".header-name").value.trim(),
+      value: row.querySelector(".header-value").value,
+    })).filter((item) => item.name);
+  }
+
+  function addHeaderRow(name = "", value = "") {
+    const empty = $("#headersTable .empty");
+    if (empty) empty.remove();
+    const row = document.createElement("div");
+    row.className = "header-row";
+    row.innerHTML = `
+      <input class="header-name" placeholder="Header 名称" value="${esc(name)}" />
+      <input class="header-value" placeholder="值，例如 Bearer {{apiKey}}" value="${esc(value)}" />
+      <button class="btn small ghost remove-header" type="button">删除</button>`;
+    $("#headersTable").appendChild(row);
+    row.querySelector(".header-name").focus();
+  }
+
+  function toggleProtocolFields() {
+    $("#customApiFields").hidden = $("#settingProtocol").value !== "custom";
+  }
+
+  function resetCustomDefaults() {
+    $("#settingApiPath").value = "/chat/completions";
+    $("#settingContentPath").value = "choices.0.message.content";
+    $("#settingViolationPath").value = "";
+    $("#settingReasonPath").value = "";
+    $("#settingRequestTemplate").value = (state.settings && state.settings.defaultRequestTemplate) || FALLBACK_TEMPLATE;
+    renderHeaderRows(defaultHeaders());
+  }
+
+  function applySingleInputPreset() {
+    const existing = collectHeaders();
+    const token = existing.find((item) => item.name.toLowerCase() === "token");
+    const local = state.localDefaults || {};
+    $("#settingMode").value = "deepseek";
+    $("#settingProtocol").value = "custom";
+    $("#settingBaseUrl").value = local.baseUrl || "http://your-internal-host";
+    $("#settingApiPath").value = local.apiPath || "/v1/chat/completions";
+    $("#settingModel").value = "deepseek-chat";
+    $("#settingTimeout").value = 90;
+    $("#settingMaxRetries").value = 3;
+    $("#settingRetryBackoff").value = 1.5;
+    $("#settingRequestInterval").value = 0.5;
+    $("#settingRequestTemplate").value = FALLBACK_SINGLE_TEMPLATE;
+    $("#settingContentPath").value = "result.finalAnswer";
+    $("#settingViolationPath").value = "";
+    $("#settingReasonPath").value = "";
+    renderHeaderRows([
+      { name: "Content-Type", value: "application/json" },
+      { name: "token", value: token ? token.value : "" },
+      { name: "userId", value: local.userId || "" },
+    ]);
+    toggleProtocolFields();
+    $("#settingsStatus").textContent = "已填入单入参默认配置；本地 local-defaults.json 可配置地址/路径/userId，token 保留原值。";
   }
 
   function openSettings() {
     const settings = state.settings || {};
     $("#settingMode").value = settings.mode || "mock";
+    $("#settingProtocol").value = settings.apiProtocol || "openai";
     $("#settingBaseUrl").value = settings.baseUrl || "https://api.deepseek.com";
     $("#settingModel").value = settings.model || "deepseek-chat";
     $("#settingApiKey").value = "";
-    $("#settingApiKey").placeholder = settings.hasApiKey ? "已配置，留空表示不修改" : "请输入 API Key";
+    $("#settingApiKey").placeholder = settings.hasApiKey ? "已配置，留空表示不修改" : "请输入 API Key（自定义接口可留空）";
+    $("#settingApiPath").value = settings.apiPath == null ? "/chat/completions" : settings.apiPath;
+    $("#settingTimeout").value = settings.timeoutSec || 90;
+    $("#settingMaxRetries").value = settings.maxRetries == null ? 3 : settings.maxRetries;
+    $("#settingRetryBackoff").value = settings.retryBackoffSec == null ? 1.5 : settings.retryBackoffSec;
+    $("#settingRequestInterval").value = settings.requestIntervalSec == null ? 0.5 : settings.requestIntervalSec;
+    $("#settingRequestTemplate").value = settings.requestTemplate || settings.defaultRequestTemplate || FALLBACK_TEMPLATE;
+    $("#settingContentPath").value = settings.contentPath || "choices.0.message.content";
+    $("#settingViolationPath").value = settings.violationPath || "";
+    $("#settingReasonPath").value = settings.reasonPath || "";
+    const headers = Array.isArray(settings.headers) ? settings.headers : defaultHeaders();
+    renderHeaderRows(headers);
+    toggleProtocolFields();
     $("#settingsStatus").textContent = "";
     $("#settingsDialog").showModal();
   }
 
-  async function saveSettings() {
-    const mode = $("#settingMode").value;
-    const payload = {
-      mode,
+  function settingsPayload() {
+    const timeout = Math.max(10, Math.min(300, Number($("#settingTimeout").value) || 90));
+    const retries = Math.max(0, Math.min(10, Number($("#settingMaxRetries").value) || 0));
+    const backoff = Math.max(0.2, Math.min(30, Number($("#settingRetryBackoff").value) || 1.5));
+    const interval = Math.max(0, Math.min(30, Number($("#settingRequestInterval").value) || 0));
+    return {
+      mode: $("#settingMode").value,
+      apiProtocol: $("#settingProtocol").value,
       baseUrl: $("#settingBaseUrl").value.trim() || "https://api.deepseek.com",
+      apiPath: $("#settingApiPath").value.trim(),
       model: $("#settingModel").value.trim() || "deepseek-chat",
+      headers: collectHeaders(),
+      requestTemplate: $("#settingRequestTemplate").value,
+      contentPath: $("#settingContentPath").value.trim(),
+      violationPath: $("#settingViolationPath").value.trim(),
+      reasonPath: $("#settingReasonPath").value.trim(),
+      timeoutSec: timeout,
+      maxRetries: retries,
+      retryBackoffSec: backoff,
+      requestIntervalSec: interval,
     };
+  }
+
+  function validateCustomSettings(payload) {
+    if (payload.apiProtocol !== "custom") return true;
+    if (!payload.contentPath) {
+      toast("自定义接口必须填写“模型文本内容”路径", "error");
+      return false;
+    }
+    try {
+      const parsed = JSON.parse(payload.requestTemplate);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error("必须是 JSON 对象");
+      }
+    } catch (error) {
+      toast(`请求体模板不是有效 JSON：${error.message}`, "error");
+      return false;
+    }
+    if (!/\{\{\s*(prompt|user|messages)\s*\}\}/.test(payload.requestTemplate)) {
+      toast("请求体模板必须包含 {{prompt}}、{{user}} 或 {{messages}}，否则不会上送通话文本；单入参接口请用 {{prompt}}", "error");
+      return false;
+    }
+    return true;
+  }
+
+  async function saveSettings() {
+    const payload = settingsPayload();
+    if (!validateCustomSettings(payload)) return;
     const key = $("#settingApiKey").value.trim();
     if (key) payload.apiKey = key;
     try {
@@ -1084,11 +1626,8 @@
   }
 
   async function testConnection() {
-    const payload = {
-      mode: $("#settingMode").value,
-      baseUrl: $("#settingBaseUrl").value.trim() || "https://api.deepseek.com",
-      model: $("#settingModel").value.trim() || "deepseek-chat",
-    };
+    const payload = settingsPayload();
+    if (!validateCustomSettings(payload)) return;
     const key = $("#settingApiKey").value.trim();
     if (key) payload.apiKey = key;
     $("#settingsStatus").textContent = "正在测试连接…";

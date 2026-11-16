@@ -17,7 +17,7 @@ $env:PYTHONIOENCODING = 'utf-8'
 Push-Location $root
 try {
   Write-Host '=== 单元测试 ===' -ForegroundColor Cyan
-  & $python -m unittest discover -s tests -v
+  & $python (Join-Path $root 'scripts\run_tests.py')
   if ($LASTEXITCODE -ne 0) { throw '单元测试失败' }
 
   Write-Host ''

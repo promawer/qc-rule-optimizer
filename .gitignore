@@ -10,8 +10,11 @@ data/
 .release-offline/
 .offline/
 .offline-test/
+.offline-*/
 wheelhouse/
 runtime/
+*.zip
+local-defaults.json
 *.log
 
 # secrets

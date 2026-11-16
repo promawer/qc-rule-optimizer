@@ -50,7 +50,7 @@ def main() -> int:
         kwargs["start_new_session"] = True
 
     process = subprocess.Popen(
-        [sys.executable, "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", str(PORT)],
+        [sys.executable, "-m", "uvicorn", "--app-dir", str(ROOT), "app.main:app", "--host", "127.0.0.1", "--port", str(PORT)],
         cwd=str(ROOT),
         stdin=subprocess.DEVNULL,
         stdout=log,

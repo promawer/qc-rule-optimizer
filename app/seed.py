@@ -11,6 +11,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 
+from .llm import DEFAULT_HEADERS, DEFAULT_REQUEST_TEMPLATE
 from .prompts import DEFAULT_SEMANTIC_PROMPT
 from .splits import build_splits
 
@@ -196,5 +197,16 @@ def build_state() -> Dict[str, Any]:
             "mode": "mock",
             "baseUrl": "https://api.deepseek.com",
             "model": "deepseek-chat",
+            "apiProtocol": "openai",
+            "apiPath": "/chat/completions",
+            "headers": [dict(item) for item in DEFAULT_HEADERS],
+            "requestTemplate": DEFAULT_REQUEST_TEMPLATE,
+            "contentPath": "choices.0.message.content",
+            "violationPath": "",
+            "reasonPath": "",
+            "timeoutSec": 90,
+            "maxRetries": 3,
+            "retryBackoffSec": 1.5,
+            "requestIntervalSec": 0.5,
         },
     }

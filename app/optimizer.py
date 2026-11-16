@@ -474,6 +474,8 @@ async def optimize(
             "rule": candidate_train["rule"],
             "metrics": candidate_train["metrics"],
             "validationMetrics": candidate_validation["metrics"],
+            "trainRows": candidate_train["rows"],
+            "validationRows": candidate_validation["rows"],
             "rationale": proposal.get("rationale", ""),
             "expectedEffect": proposal.get("expectedEffect", ""),
             "source": proposal.get("source", ""),
