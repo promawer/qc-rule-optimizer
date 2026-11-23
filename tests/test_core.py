@@ -147,7 +147,7 @@ class MigrationTest(unittest.TestCase):
             "settings": {},
         }
         migrated = migrate(old)
-        self.assertEqual(migrated["version"], 2)
+        self.assertEqual(migrated["version"], 3)
         self.assertEqual(migrated["rules"][0]["code"], "R001")
         self.assertEqual(len(migrated["calls"]), 2)
         self.assertEqual(migrated["calls"][0]["autoRules"], ["R001"])
@@ -230,8 +230,8 @@ class OptimizerTest(unittest.TestCase):
                 })
 
         add(TRAIN, 6, 4)
-        add(VALIDATION, 3, 1)
-        add(TEST, 3, 1)
+        add(VALIDATION, 10, 5)
+        add(TEST, 10, 5)
 
         async def judge(case, rule):
             return False, "mock"
@@ -249,10 +249,14 @@ class OptimizerTest(unittest.TestCase):
             return judge
 
         rule = {"name": "测试规则", "regex": "不会命中", "semantic": "", "logic": "OR"}
+        async def guard(candidate, prompt):
+            return {"status": "PASS", "checks": [], "reasons": ["测试中无其他语义规则"]}
+
         result = asyncio.run(
             optimize(
                 rule, cases, 0.9, 2, factory, Proposer(), DEFAULT_SEMANTIC_PROMPT,
                 lambda event: None, lambda: False,
+                prompt_guard=guard,
             )
         )
         self.assertEqual(result["status"], "reached")
@@ -282,23 +286,26 @@ class SplitTest(unittest.TestCase):
             for split in (TRAIN, VALIDATION, TEST):
                 self.assertTrue(any(value == split for value in mapping.values()))
 
-    def test_split_of_rule_with_enough_positives_covers_all_sets(self):
+    def test_small_rule_keeps_global_split_even_when_class_missing(self):
         state = build_state()
         rule = next(item for item in state["rules"] if item["code"] == "R001")
         cases = cases_for_rule(state["calls"], rule, state["splits"])
         grouped = split_cases(cases)
-        for split in (TRAIN, VALIDATION, TEST):
-            self.assertGreaterEqual(sum(1 for c in grouped[split] if c["humanResult"] == VIOLATION), 1)
+        self.assertEqual(sum(len(items) for items in grouped.values()), len(state["calls"]))
+        mappings = list(state["splits"].values())
+        self.assertTrue(all(mapping == mappings[0] for mapping in mappings))
+        self.assertTrue(any(not any(c["humanResult"] == VIOLATION for c in grouped[split])
+                            for split in (TRAIN, VALIDATION, TEST)))
 
 
 class GateTest(unittest.TestCase):
     def _metrics(self, accuracy):
-        return {"accuracy": accuracy}
+        return {"accuracy": accuracy, "recall": .95, "falsePositiveRate": .05, "coverage": 1, "total": 20, "fn": 1, "fp": 1}
 
     def test_gate_passes_only_when_validation_and_test_both_pass(self):
         summary = {
-            VALIDATION: {"positives": 2, "negatives": 4},
-            TEST: {"positives": 2, "negatives": 4},
+            VALIDATION: {"positives": 5, "negatives": 15},
+            TEST: {"positives": 5, "negatives": 15},
         }
         gate = compute_gate(
             {"metrics": self._metrics(0.95)},
@@ -313,8 +320,8 @@ class GateTest(unittest.TestCase):
 
     def test_gate_blocks_when_test_regresses(self):
         summary = {
-            VALIDATION: {"positives": 2, "negatives": 4},
-            TEST: {"positives": 2, "negatives": 4},
+            VALIDATION: {"positives": 5, "negatives": 15},
+            TEST: {"positives": 5, "negatives": 15},
         }
         gate = compute_gate(
             {"metrics": self._metrics(0.95)},
@@ -330,7 +337,7 @@ class GateTest(unittest.TestCase):
 
     def test_gate_marks_insufficient_when_test_has_no_positives(self):
         summary = {
-            VALIDATION: {"positives": 2, "negatives": 4},
+            VALIDATION: {"positives": 5, "negatives": 15},
             TEST: {"positives": 0, "negatives": 2},
         }
         gate = compute_gate(

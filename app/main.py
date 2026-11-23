@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import os
 import re
@@ -15,7 +16,7 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .evaluator import EvaluationError, JobCancelled, evaluate_rule
 from .importer import build_calls, calls_to_csv, cases_for_rule
@@ -36,8 +37,15 @@ from .llm import (
 from .models import (
     NORMAL, VIOLATION, ApplyInput, BatchOptimizeInput, OptimizeInput, PromptInput, RuleInput, SettingsInput, rule_flags,
 )
+from .data_governance import refresh_dataset, sync_label_codes
+from .governance import (register_governance, enrich_rule, enrich_rules, model_manifest,
+                         assert_no_holdout_overlap)
+from .experiments import freeze_experiment, checkpoint, restore_jobs, code_fingerprint
+from .capabilities import regex_evidence, role_context_valid
+from .regex_safety import RegexTimeout
 from .optimizer import LLMProposer, MockProposer, optimize
 from .prompts import DEFAULT_SEMANTIC_PROMPT, render_prompt, validate_prompt
+from .prompt_regression import context_fingerprint, make_prompt_guard, rules_with_candidate
 from .rule_importer import parse_rule_file
 from .splits import SPLITS, TEST, TRAIN, VALIDATION, build_splits, split_cases, split_summary
 from .store import BASE_DIR, STORE_PATH, Store
@@ -46,10 +54,12 @@ STATIC_DIR = BASE_DIR / "static"
 JOB_LOG_DIR = BASE_DIR / ".run" / "jobs"
 JOB_LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="质检规则优化台", version="2.6.2")
+app = FastAPI(title="质检能力自进化工作台", version="3.0.0")
 store = Store(Path(os.environ.get("QCO_STORE", str(STORE_PATH))))
 RUNTIME: Dict[str, str] = {"apiKey": os.environ.get("DEEPSEEK_API_KEY", "")}
-JOBS: Dict[str, Dict[str, Any]] = {}
+CHECKPOINT_DIR = store.path.parent / "job-checkpoints"
+EXPERIMENT_DIR = store.path.parent / "experiments"
+JOBS: Dict[str, Dict[str, Any]] = restore_jobs(CHECKPOINT_DIR)
 TASKS: Dict[str, "asyncio.Task[Any]"] = {}
 MAX_DATASET = 2000
 
@@ -126,7 +136,8 @@ def _dataset_summary(cases: List[Dict[str, Any]]) -> Dict[str, Any]:
     labels = {VIOLATION: 0, NORMAL: 0, "UNKNOWN": 0}
     for case in cases:
         labels[case.get("humanResult", "UNKNOWN")] = labels.get(case.get("humanResult", "UNKNOWN"), 0) + 1
-    auto_rows = [c for c in cases if c.get("autoResult") in (VIOLATION, NORMAL)]
+    auto_rows = [c for c in cases if c.get("autoResult") in (VIOLATION, NORMAL)
+                 and c.get("humanResult") in (VIOLATION, NORMAL)]
     auto_correct = sum(1 for c in auto_rows if c["autoResult"] == c["humanResult"])
     return {
         "total": len(cases),
@@ -145,7 +156,7 @@ def _rule_cases(state: Dict[str, Any], rule: Dict[str, Any]) -> List[Dict[str, A
 
 
 def _rebuild_splits(state: Dict[str, Any]) -> None:
-    state["splits"] = build_splits(state.get("rules") or [], state.get("calls") or [])
+    refresh_dataset(state, "规则或数据更新")
 
 
 def _ensure_code_unique(state: Dict[str, Any], code: str, exclude_id: Optional[str] = None) -> None:
@@ -156,11 +167,22 @@ def _ensure_code_unique(state: Dict[str, Any], code: str, exclude_id: Optional[s
             raise HTTPException(status_code=400, detail=f"规则编号 {code} 已被「{rule['name']}」使用")
 
 
-CONTENT_FIELDS = ("code", "name", "description", "regex", "semantic", "logic")
+CONTENT_FIELDS = ("code", "name", "description", "regex", "semantic", "logic", "actor", "workflow",
+                  "responseWindowTurns", "responseRequirement", "knowledgeIds")
 
 
 def _rule_content(rule: Dict[str, Any]) -> Dict[str, Any]:
     return {key: rule.get(key, "") for key in CONTENT_FIELDS}
+
+
+def _payload_content(payload: RuleInput) -> Dict[str, Any]:
+    return {key: getattr(payload, key) for key in CONTENT_FIELDS}
+
+
+def _check_knowledge(state, rule):
+    approved = {k["id"] for k in state.get("knowledge", []) if k.get("status") == "APPROVED"}
+    if any(key not in approved for key in rule.get("knowledgeIds", [])):
+        raise HTTPException(400, "只能关联已批准的知识；请先完成知识审核")
 
 
 def _append_change(
@@ -194,7 +216,9 @@ async def health() -> Dict[str, Any]:
     settings = store.settings()
     return {
         "status": "ok",
-        "version": "2.6.2",
+        "version": "3.0.0",
+        "datasetVersion": state.get("datasetVersion", 1),
+        "deploymentScope": "LOCAL_GATEWAY",
         "mode": settings.get("mode", "mock"),
         "model": settings.get("model", ""),
         "hasApiKey": bool(RUNTIME.get("apiKey")),
@@ -254,6 +278,7 @@ def _config_from_input(payload: SettingsInput) -> Dict[str, Any]:
 
 @app.put("/api/settings")
 async def put_settings(payload: SettingsInput) -> Dict[str, Any]:
+    _ensure_no_active_job()
     try:
         config = _config_from_input(payload)
     except LLMError as exc:
@@ -309,6 +334,7 @@ async def get_semantic_prompt() -> Dict[str, Any]:
 
 @app.put("/api/semantic-prompt")
 async def put_semantic_prompt(payload: PromptInput) -> Dict[str, Any]:
+    _ensure_no_active_job()
     state = store.snapshot()
     current = _semantic_prompt(state)
     try:
@@ -352,10 +378,13 @@ async def list_rules() -> List[Dict[str, Any]]:
 
 @app.post("/api/rules")
 async def create_rule(payload: RuleInput) -> Dict[str, Any]:
+    _ensure_no_active_job()
     def mutate(state: Dict[str, Any]) -> Dict[str, Any]:
         _ensure_code_unique(state, payload.code)
+        _check_knowledge(state, payload.dict())
         stamp = now()
         rule = {
+            **_payload_content(payload),
             "id": "rule-" + uuid.uuid4().hex[:8],
             "code": payload.code,
             "name": payload.name,
@@ -389,6 +418,7 @@ async def import_rules(
     mode: str = Form("merge"),
     reason: str = Form("规则文件导入"),
 ) -> Dict[str, Any]:
+    _ensure_no_active_job()
     content = await file.read()
     if len(content) > 5 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="规则文件不能超过 5 MB")
@@ -440,6 +470,7 @@ async def import_rules(
                 "semantic": item["semantic"],
                 "logic": item["logic"],
             }
+            after = {**before, **after}
             changed = [key for key in CONTENT_FIELDS if before.get(key) != after.get(key)]
             if not changed:
                 skipped += 1
@@ -466,18 +497,13 @@ async def import_rules(
 
 @app.put("/api/rules/{rule_id}")
 async def update_rule(rule_id: str, payload: RuleInput) -> Dict[str, Any]:
+    _ensure_no_active_job()
     def mutate(state: Dict[str, Any]) -> Dict[str, Any]:
         rule = _rule_or_404(state, rule_id)
         _ensure_code_unique(state, payload.code, exclude_id=rule_id)
+        _check_knowledge(state, payload.dict())
         before = _rule_content(rule)
-        after = {
-            "code": payload.code,
-            "name": payload.name,
-            "description": payload.description,
-            "regex": payload.regex,
-            "semantic": payload.semantic,
-            "logic": payload.logic,
-        }
+        after = _payload_content(payload)
         changed = [key for key in CONTENT_FIELDS if before.get(key) != after.get(key)]
         if not changed:
             return rule
@@ -495,6 +521,7 @@ async def update_rule(rule_id: str, payload: RuleInput) -> Dict[str, Any]:
 
 @app.delete("/api/rules/{rule_id}")
 async def delete_rule(rule_id: str) -> Dict[str, Any]:
+    _ensure_no_active_job()
     if any(job["ruleId"] == rule_id and job["status"] in ("queued", "running") for job in JOBS.values()):
         raise HTTPException(status_code=409, detail="该规则有正在执行的优化任务，请先取消")
 
@@ -508,7 +535,7 @@ async def delete_rule(rule_id: str) -> Dict[str, Any]:
 
 
 class RegexTestInput(BaseModel):
-    transcript: str = ""
+    transcript: str = Field(default="", max_length=20000)
 
 
 @app.post("/api/rules/{rule_id}/test-regex")
@@ -519,10 +546,13 @@ async def test_regex(rule_id: str, payload: RegexTestInput) -> Dict[str, Any]:
     if not flags["regex"]:
         return {"regexHit": None, "error": "该规则没有配置正则表达式"}
     try:
-        hit = bool(re.search(str(rule["regex"]), payload.transcript))
-    except re.error as exc:
+        if not role_context_valid(rule, payload.transcript):
+            return {"regexHit": None, "error": "无法识别所需角色，请按客户/坐席分行提供原文"}
+        evidence = regex_evidence(rule, payload.transcript)
+        hit = bool(evidence)
+    except (re.error, RegexTimeout) as exc:
         return {"regexHit": None, "error": f"正则无法编译：{exc}"}
-    return {"regexHit": hit, "error": ""}
+    return {"regexHit": hit, "error": "", "evidence": evidence}
 
 
 # ---------------------------------------------------------------- 数据
@@ -540,6 +570,8 @@ async def get_dataset_overview() -> Dict[str, Any]:
             "autoPositives": sum(1 for call in calls if code in (call.get("autoRules") or [])),
         })
     return {
+        "datasetVersion": state.get("datasetVersion", 1),
+        "migrationWarnings": state.get("dataWarnings", []),
         "total": len(calls),
         "callsWithHumanViolation": sum(1 for call in calls if call.get("humanRules")),
         "callsWithAutoViolation": sum(1 for call in calls if call.get("autoRules")),
@@ -554,6 +586,7 @@ async def get_dataset(rule_id: str, limit: int = 100, offset: int = 0) -> Dict[s
     cases = _rule_cases(state, rule)
     limit = max(1, min(limit, 500))
     return {
+        "datasetVersion": state.get("datasetVersion", 1),
         **_dataset_summary(cases),
         "ruleCode": rule["code"],
         "callTotal": len(state.get("calls") or []),
@@ -565,7 +598,9 @@ async def get_dataset(rule_id: str, limit: int = 100, offset: int = 0) -> Dict[s
 
 
 @app.post("/api/dataset/import")
-async def import_dataset(file: UploadFile = File(...), mode: str = Form("replace")) -> Dict[str, Any]:
+async def import_dataset(file: UploadFile = File(...), mode: str = Form("replace"),
+                         fullyReviewed: bool = Form(False)) -> Dict[str, Any]:
+    _ensure_no_active_job()
     if mode not in ("replace", "append"):
         raise HTTPException(status_code=400, detail="mode 只能是 replace 或 append")
     state = store.snapshot()
@@ -573,11 +608,12 @@ async def import_dataset(file: UploadFile = File(...), mode: str = Form("replace
     if len(content) > 10 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="文件超过 10MB")
     try:
-        calls, report = build_calls(file.filename or "upload.csv", content, state["rules"])
+        calls, report = build_calls(file.filename or "upload.csv", content, state["rules"], fully_reviewed=fullyReviewed)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     def mutate(draft: Dict[str, Any]) -> int:
+        assert_no_holdout_overlap(calls, [c for h in draft.get("holdouts", []) for c in h["calls"]])
         existing = draft.get("calls") or []
         if mode == "replace":
             merged = calls
@@ -595,8 +631,10 @@ async def import_dataset(file: UploadFile = File(...), mode: str = Form("replace
 
 @app.delete("/api/dataset")
 async def clear_dataset() -> Dict[str, Any]:
+    _ensure_no_active_job()
     def mutate(state: Dict[str, Any]) -> int:
         state["calls"] = []
+        _rebuild_splits(state)
         return 0
 
     store.mutate(mutate)
@@ -633,7 +671,8 @@ async def sample_dataset() -> Response:
 
 # ---------------------------------------------------------------- 优化任务
 def _job_public(job: Dict[str, Any]) -> Dict[str, Any]:
-    return {key: value for key, value in job.items() if not key.endswith("Rows") and key != "cancelRequested"}
+    return {key: value for key, value in job.items() if not key.endswith("Rows")
+            and not key.startswith("_") and key != "cancelRequested"}
 
 
 def _append_job_file(job: Dict[str, Any], text: str) -> None:
@@ -659,9 +698,6 @@ def _make_llm_trace(job: Dict[str, Any]):
                 f"systemChars={event.get('systemChars')} userChars={event.get('userChars')} "
                 f"promptChars={event.get('promptChars')} "
                 f"containsTranscript={event.get('containsTranscript')}\n"
-                f"TEMPLATE: {event.get('template') or ''}\n"
-                f"HEADERS: {json.dumps(event.get('headers') or {}, ensure_ascii=False)}\n"
-                f"BODY: {event.get('payloadText') or ''}\n"
             ))
         elif kind == "response":
             status = int(event.get("status") or 0)
@@ -670,7 +706,6 @@ def _make_llm_trace(job: Dict[str, Any]):
                 f"{now()} [LLM RESPONSE] call={call} attempt={attempt} "
                 f"status={status} durationMs={event.get('durationMs')} "
                 f"bodyChars={len(body)} truncated={event.get('bodyTruncated')}\n"
-                f"BODY: {body}\n"
             ))
             _emit(job, {
                 "type": "log",
@@ -732,6 +767,8 @@ def _emit(job: Dict[str, Any], event: Dict[str, Any]) -> None:
     job["updatedAt"] = now()
     if line:
         _append_job_file(job, f"{now()} {line}")
+    if kind in ("phase", "iteration") or job.get("finishedAt"):
+        checkpoint(job, CHECKPOINT_DIR)
 
 
 def _sample_cases(cases: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
@@ -754,6 +791,8 @@ def _sample_cases(cases: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any
 
 def _save_run(job: Dict[str, Any]) -> None:
     run = {
+        **{key: job.get(key) for key in ("contextFingerprint", "codeFingerprint", "datasetVersion", "manifestId", "policy",
+                                       "stopReason", "budget", "sharedInputChanged", "mode", "simulated")},
         "id": job["id"],
         "ruleId": job["ruleId"],
         "ruleName": job["ruleName"],
@@ -774,6 +813,7 @@ def _save_run(job: Dict[str, Any]) -> None:
         "baselinePrompt": job.get("baselinePrompt"),
         "bestPrompt": job.get("bestPrompt"),
         "promptChanged": job.get("promptChanged"),
+        "promptRegression": job.get("promptRegression"),
         "iterations": job.get("iterations", []),
         "createdAt": job["createdAt"],
         "finishedAt": job.get("finishedAt"),
@@ -782,8 +822,8 @@ def _save_run(job: Dict[str, Any]) -> None:
     }
 
     def mutate(state: Dict[str, Any]) -> None:
+        state["runs"] = [r for r in state.get("runs", []) if r["id"] != run["id"]]
         state["runs"].insert(0, run)
-        del state["runs"][50:]
 
     store.mutate(mutate)
 
@@ -792,12 +832,15 @@ def _make_judge_factory(llm: Optional[LLMClient], all_rules: List[Dict[str, Any]
     def factory(prompt: str, with_reason: bool):
         if llm is None:
             async def mock_judge(case: Dict[str, Any], rule: Dict[str, Any]):
+                if rule.get("workflow") == "COMPLAINT_RESPONSE":
+                    return {"violation": None, "reason": "投诉分步判断需真实模型，模拟模式不生成语义结论",
+                            "reviewRequired": True, "evidenceValid": False}
                 return False, ("模拟模式：语义部分未调用模型" if with_reason else "")
 
             return mock_judge
 
         async def judge(case: Dict[str, Any], rule: Dict[str, Any]):
-            return await judge_semantic(llm, case, rule, prompt, all_rules, with_reason)
+            return await judge_semantic(llm, case, rule, prompt, rules_with_candidate(all_rules, rule), with_reason)
 
         return judge
 
@@ -815,8 +858,9 @@ async def _execute_optimize(
     job["startedAt"] = now()
     _emit(job, {"type": "log", "message": f"开始优化：{job['ruleName']}，样本 {len(cases)} 条，目标准确率 {job['target']:.0%}"})
     try:
-        state = store.snapshot()
-        all_rules = state.get("rules") or []
+        state = job.get("_context") or store.snapshot()
+        all_rules = enrich_rules(state)
+        rule = enrich_rule(state, rule)
         prompt = _semantic_prompt(state)
         job["baselinePrompt"] = prompt
         job["bestPrompt"] = prompt
@@ -837,11 +881,22 @@ async def _execute_optimize(
         else:
             proposer = MockProposer()
 
+        async def regression_judge(case, other_rule, semantic_prompt, regression_rules):
+            if llm is None:
+                raise LLMError("模拟模式不能验证通用语义提示词")
+            return await judge_semantic(llm, case, enrich_rule(state, other_rule), semantic_prompt,
+                                        [enrich_rule(state, item) for item in regression_rules], False)
+
         result = await optimize(
             rule, cases, job["target"], job["maxRounds"],
             _make_judge_factory(llm, all_rules), proposer, prompt,
             emit=lambda event: _emit(job, event),
             is_cancelled=lambda: bool(job.get("cancelRequested")),
+            prompt_guard=make_prompt_guard(
+                state, rule, regression_judge, lambda event: _emit(job, event),
+                lambda: bool(job.get("cancelRequested")),
+            ),
+            policy=job.get("policy"),
         )
         job["status"] = result["status"]
         job["baseline"] = result["baseline"]["train"]["metrics"]
@@ -873,6 +928,11 @@ async def _execute_optimize(
         job["baselinePrompt"] = result["baselinePrompt"]
         job["bestPrompt"] = result["bestPrompt"]
         job["promptChanged"] = result["promptChanged"]
+        job["promptRegression"] = result["promptRegression"]
+        for key in ("stopReason", "budget", "sharedInputChanged"):
+            job[key] = result.get(key)
+        job["simulated"] = settings.get("mode") != "deepseek"
+        job["mode"] = settings.get("mode", "mock")
         _emit(job, {"type": "log", "message": (
             f"优化结束：{job['status']}；验证集 {job['bestValidation']['accuracy']:.1%}，"
             f"测试集 {job['bestTest']['accuracy']:.1%}；泛化验收 {job['gate']['status']}"
@@ -925,6 +985,7 @@ async def _execute_optimize(
                 _save_run(job)
             except Exception as exc:  # noqa: BLE001
                 _emit(job, {"type": "log", "level": "error", "message": f"运行记录保存失败：{exc}"})
+        checkpoint(job, CHECKPOINT_DIR)
 
 
 async def _execute_evaluate(
@@ -937,8 +998,9 @@ async def _execute_evaluate(
     job["status"] = "running"
     job["startedAt"] = now()
     try:
-        state = store.snapshot()
-        all_rules = state.get("rules") or []
+        state = job.get("_context") or store.snapshot()
+        all_rules = enrich_rules(state)
+        rule = enrich_rule(state, rule)
         prompt = _semantic_prompt(state)
         job["baselinePrompt"] = prompt
         job["bestPrompt"] = prompt
@@ -1029,6 +1091,7 @@ async def _execute_evaluate(
             "cancelled": "已取消",
             "failed": "评测失败",
         }.get(job["status"], "已结束")
+        checkpoint(job, CHECKPOINT_DIR)
         if job.get("llmStats"):
             stats = job["llmStats"]
             _emit(job, {
@@ -1079,6 +1142,11 @@ async def evaluate_current(rule_id: str) -> Dict[str, Any]:
         "error": None,
         "cancelRequested": False,
     }
+    job["sampledCallIds"] = [c["callId"] for c in cases]
+    job["mode"] = settings.get("mode", "mock")
+    job["simulated"] = job["mode"] == "mock"
+    freeze_experiment(state, job, EXPERIMENT_DIR)
+    checkpoint(job, CHECKPOINT_DIR)
     JOBS[job_id] = job
     _cleanup_jobs()
     TASKS[job_id] = asyncio.create_task(_execute_evaluate(job, dict(rule), cases, settings))
@@ -1164,6 +1232,11 @@ async def start_optimize(payload: OptimizeInput) -> Dict[str, Any]:
     )
     _ensure_no_active_job()
     job = _new_optimize_job(rule, sampled, payload.targetAccuracy, payload.maxRounds)
+    job["policy"] = payload.evaluationPolicy.dict()
+    job["sampledCallIds"] = [c["callId"] for c in sampled]
+    job["mode"] = settings.get("mode", "mock")
+    freeze_experiment(state, job, EXPERIMENT_DIR)
+    checkpoint(job, CHECKPOINT_DIR)
     JOBS[job["id"]] = job
     _cleanup_jobs()
     TASKS[job["id"]] = asyncio.create_task(_execute_optimize(job, dict(rule), sampled, settings))
@@ -1183,7 +1256,7 @@ async def _execute_batch(
     total = len(rules)
     _emit(parent, {"type": "log", "message": f"开始批量优化：{total} 条规则，目标 {target:.0%}"})
     try:
-        state = store.snapshot()
+        state = parent.get("_context") or store.snapshot()
         for index, rule in enumerate(rules):
             if parent.get("cancelRequested"):
                 raise JobCancelled()
@@ -1220,6 +1293,10 @@ async def _execute_batch(
                 + grouped[TEST]
             )
             child = _new_optimize_job(rule, sampled, target, max_rounds, parent_id=parent["id"])
+            child["policy"] = parent.get("policy", {})
+            child["sampledCallIds"] = [c["callId"] for c in sampled]
+            child["mode"] = settings.get("mode", "mock")
+            freeze_experiment(state, child, EXPERIMENT_DIR)
             JOBS[child["id"]] = child
             parent["currentJobId"] = child["id"]
             _emit(parent, {"type": "log", "message": f"{parent['currentRule']} 开始，任务 {child['id']}"})
@@ -1313,7 +1390,9 @@ async def start_batch_optimize(payload: BatchOptimizeInput) -> Dict[str, Any]:
         "logs": [],
         "error": None,
         "cancelRequested": False,
+        "policy": payload.evaluationPolicy.dict(),
     }
+    freeze_experiment(state, parent, EXPERIMENT_DIR)
     JOBS[parent["id"]] = parent
     _cleanup_jobs()
     TASKS[parent["id"]] = asyncio.create_task(_execute_batch(
@@ -1345,6 +1424,8 @@ def _active_job() -> Optional[Dict[str, Any]]:
 
 
 def _ensure_no_active_job() -> None:
+    if any(r.get("status") == "EVALUATING" for r in store.snapshot().get("releases", [])):
+        raise HTTPException(409, "独立验收正在运行，请等待完成后修改数据或启动其他任务")
     job = _active_job()
     if job:
         raise HTTPException(
@@ -1512,6 +1593,7 @@ async def get_run(run_id: str) -> Dict[str, Any]:
 
 @app.post("/api/runs/{run_id}/apply")
 async def apply_run(run_id: str, payload: Optional[ApplyInput] = None) -> Dict[str, Any]:
+    _ensure_no_active_job()
     reason = (payload.reason if payload else "").strip()
     force = bool(payload.force) if payload else False
     if not reason:
@@ -1530,9 +1612,12 @@ async def apply_run(run_id: str, payload: Optional[ApplyInput] = None) -> Dict[s
         raise HTTPException(status_code=400, detail="该记录没有可应用的规则内容")
 
     def mutate(draft: Dict[str, Any]) -> Dict[str, Any]:
+        if run.get("contextFingerprint") != context_fingerprint(draft) or run.get("codeFingerprint") != code_fingerprint():
+            raise HTTPException(409, "实验依据或执行代码已变化，请重新评测；强制应用不能覆盖过期版本")
         rule = _rule_or_404(draft, run["ruleId"])
         before = _rule_content(rule)
         after = {
+            **before,
             "code": rule.get("code"),
             "name": rule.get("name"),
             "description": rule.get("description"),
@@ -1542,8 +1627,14 @@ async def apply_run(run_id: str, payload: Optional[ApplyInput] = None) -> Dict[s
         }
         changed = [key for key in CONTENT_FIELDS if before.get(key) != after.get(key)]
         prompt_before = _semantic_prompt(draft)
-        prompt_after = str(run.get("bestPrompt") or prompt_before)
+        prompt_after = str(run.get("bestPrompt") or prompt_before) if run.get("promptChanged") else prompt_before
         prompt_changed = prompt_after != prompt_before
+        if prompt_changed or run.get("sharedInputChanged"):
+            regression = run.get("promptRegression") or {}
+            if regression.get("status") != "PASS":
+                raise HTTPException(status_code=409, detail="通用提示词缺少通过的跨规则回归，请重新优化；强制应用不能跳过此检查")
+            if regression.get("contextFingerprint") != context_fingerprint(draft):
+                raise HTTPException(status_code=409, detail="规则、通话数据、模型配置或通用提示词已变化，跨规则回归已过期，请重新优化")
         if not changed and not prompt_changed:
             raise HTTPException(status_code=409, detail="候选规则与当前规则一致，无需应用")
         if changed:
@@ -1578,6 +1669,46 @@ async def apply_run(run_id: str, payload: Optional[ApplyInput] = None) -> Dict[s
 
 
 # ---------------------------------------------------------------- 静态页面
+def _bundle_client(bundle):
+    settings = store.settings()
+    if settings.get("mode") != "deepseek":
+        raise HTTPException(409, "运行冻结能力和独立验收需要真实模型配置")
+    if model_manifest(settings) != bundle["model"]:
+        raise HTTPException(409, "模型配置与冻结版本不一致，请恢复冻结配置或重新验收")
+    _ensure_llm_ready(settings)
+    return LLMClient(settings.get("baseUrl", ""), settings.get("model", ""),
+                     RUNTIME.get("apiKey", ""), config=_api_config(settings))
+
+
+async def _evaluate_bundle(bundle, calls):
+    client = _bundle_client(bundle)
+    try:
+        rule = bundle["rule"]
+        cases = cases_for_rule(calls, rule)
+        if any(c.get("humanResult") not in (NORMAL, VIOLATION) for c in cases):
+            raise EvaluationError("独立集含未复核或未知标签；请先完成人工标注后重新导入")
+        return await evaluate_rule(rule, cases, _make_judge_factory(client, bundle["rules"])(bundle["prompt"], True),
+                                   force_parts=False, with_reason=True, cache_scope=bundle["prompt"])
+    finally:
+        await client.aclose()
+
+
+async def _runtime_judge(bundle, case):
+    client = _bundle_client(bundle)
+    try:
+        result = await evaluate_rule(bundle["rule"], [dict(case, humanResult="UNKNOWN")],
+                                     _make_judge_factory(client, bundle["rules"])(bundle["prompt"], True),
+                                     with_reason=True, allow_unlabeled=True)
+        row = result["rows"][0]
+        return {key: row.get(key) for key in ("predicted", "reason", "regexEvidence", "evidence", "steps",
+                                             "evidenceValid", "evidenceErrors", "reviewRequired", "error")}
+    finally:
+        await client.aclose()
+
+
+register_governance(app, store, _evaluate_bundle, _runtime_judge, _ensure_no_active_job)
+
+
 @app.get("/")
 async def index() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")

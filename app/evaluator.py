@@ -1,15 +1,18 @@
 """规则评测：正则 + 语义按 OR/AND 组合，逐条对照人工标签计算指标。"""
 from __future__ import annotations
 
-import asyncio
+import copy
 import hashlib
+import json
 import re
 import time
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from .models import NORMAL, VIOLATION, rule_flags
+from .capabilities import regex_evidence, role_context_valid
+from .regex_safety import RegexTimeout
 
-Judge = Callable[[Dict[str, Any], Dict[str, Any]], Awaitable[Tuple[bool, str]]]
+Judge = Callable[[Dict[str, Any], Dict[str, Any]], Awaitable[Any]]
 
 
 class EvaluationError(Exception):
@@ -23,37 +26,69 @@ class JobCancelled(Exception):
 
 
 def _metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
-    evaluated = [
-        row for row in rows
-        if row["predicted"] is not None and row["humanResult"] in (VIOLATION, NORMAL)
-    ]
+    """以已知人工标签为固定分母；待复核及失败判定不能虚增准确率。"""
+    labeled = [r for r in rows if r.get("humanResult") in (VIOLATION, NORMAL)]
+    evaluated = [r for r in labeled if r.get("predicted") is not None]
     tp = sum(1 for r in evaluated if r["predicted"] and r["humanResult"] == VIOLATION)
     fp = sum(1 for r in evaluated if r["predicted"] and r["humanResult"] == NORMAL)
     tn = sum(1 for r in evaluated if not r["predicted"] and r["humanResult"] == NORMAL)
     fn = sum(1 for r in evaluated if not r["predicted"] and r["humanResult"] == VIOLATION)
-    total = len(evaluated)
+    positives = sum(r["humanResult"] == VIOLATION for r in labeled)
+    negatives = len(labeled) - positives
+    unresolved_positives = positives - tp - fn
+    unresolved_normals = negatives - tn - fp
     correct = tp + tn
     precision = tp / (tp + fp) if tp + fp else 0.0
-    recall = tp / (tp + fn) if tp + fn else 0.0
+    recall = tp / positives if positives else 0.0
     f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
-    auto_rows = [r for r in rows if r["autoResult"] in (VIOLATION, NORMAL) and r["humanResult"] in (VIOLATION, NORMAL)]
-    auto_correct = sum(1 for r in auto_rows if r["autoResult"] == r["humanResult"])
+    auto_rows = [r for r in labeled if r.get("autoResult") in (VIOLATION, NORMAL)]
+    auto_correct = sum(r["autoResult"] == r["humanResult"] for r in auto_rows)
+    step_pairs = [(expected, (row.get("steps") or {}).get(key)) for row in labeled
+                  for key, expected in (row.get("humanSteps") or {}).items() if isinstance(expected, bool)]
+    gold_evidence = [(row, ev) for row in labeled for ev in (row.get("humanEvidence") or [])
+                     if isinstance(ev, dict) and ev.get("quote")]
+    matched_evidence = sum(any(
+        expected["quote"] in observed.get("quote", "")
+        and (not expected.get("turnId") or expected["turnId"] == observed.get("turnId"))
+        and (not expected.get("role") or expected["role"] == observed.get("role"))
+        for observed in row.get("evidence", [])) for row, expected in gold_evidence)
     return {
-        "total": total,
+        "total": len(labeled), "inputTotal": len(rows), "evaluated": len(evaluated),
+        "excludedUnknown": len(rows) - len(labeled),
+        "unresolved": len(labeled) - len(evaluated),
+        "unresolvedPositives": unresolved_positives, "unresolvedNormals": unresolved_normals,
+        "failed": sum(bool(r.get("error")) for r in labeled),
         "correct": correct,
-        "accuracy": round(correct / total, 4) if total else 0.0,
-        "precision": round(precision, 4),
-        "recall": round(recall, 4),
-        "f1": round(f1, 4),
-        "tp": tp,
-        "fp": fp,
-        "tn": tn,
-        "fn": fn,
+        "accuracy": round(correct / len(labeled), 4) if labeled else 0.0,
+        "validAccuracy": round(correct / len(evaluated), 4) if evaluated else 0.0,
+        "coverage": round(len(evaluated) / len(labeled), 4) if labeled else 0.0,
+        "precision": round(precision, 4), "recall": round(recall, 4), "f1": round(f1, 4),
+        "falsePositiveRate": round(fp / negatives, 4) if negatives else 0.0,
+        "tp": tp, "fp": fp, "tn": tn, "fn": fn,
         "autoTotal": len(auto_rows),
         "autoAccuracy": round(auto_correct / len(auto_rows), 4) if auto_rows else None,
-        "violations": sum(1 for r in rows if r["humanResult"] == VIOLATION),
-        "normals": sum(1 for r in rows if r["humanResult"] == NORMAL),
+        "violations": positives, "normals": negatives,
+        "stepTotal": len(step_pairs),
+        "stepAccuracy": round(sum(a is b for a, b in step_pairs) / len(step_pairs), 4) if step_pairs else None,
+        "goldEvidenceTotal": len(gold_evidence),
+        "goldEvidenceRecall": round(matched_evidence / len(gold_evidence), 4) if gold_evidence else None,
     }
+
+
+def _judgment(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        result = copy.deepcopy(value)
+    elif isinstance(value, (tuple, list)) and len(value) == 2:
+        result = {"violation": value[0], "reason": str(value[1] or "")}
+    else:
+        raise ValueError("判定结果必须为结构化对象或二元判定")
+    if result.get("violation") is not None and not isinstance(result["violation"], bool):
+        raise ValueError("violation 必须是布尔值或未知 null")
+    result.setdefault("evidence", [])
+    result.setdefault("steps", {})
+    result.setdefault("evidenceValid", True)
+    result.setdefault("reviewRequired", result.get("violation") is None)
+    return result
 
 
 async def evaluate_rule(
@@ -61,12 +96,13 @@ async def evaluate_rule(
     cases: List[Dict[str, Any]],
     judge: Judge,
     *,
-    cache: Optional[Dict[str, Tuple[bool, str]]] = None,
+    cache: Optional[Dict[str, Any]] = None,
     progress: Optional[Callable[[int, int], None]] = None,
     is_cancelled: Optional[Callable[[], bool]] = None,
     force_parts: bool = False,
     with_reason: bool = True,
     cache_scope: str = "",
+    allow_unlabeled: bool = False,
 ) -> Dict[str, Any]:
     flags = rule_flags(rule)
     if not any(flags.values()):
@@ -82,7 +118,7 @@ async def evaluate_rule(
             raise EvaluationError(f"正则表达式无法编译：{exc}") from exc
 
     logic = str(rule.get("logic") or "OR").upper()
-    semantic_text = str(rule.get("semantic") or "").strip()
+    workflow = rule.get("workflow", "SIMPLE")
     cache = cache if cache is not None else {}
     total = len(cases)
     progress_state = {"done": 0, "semantic": 0, "errors": 0}
@@ -93,16 +129,29 @@ async def evaluate_rule(
         if is_cancelled and is_cancelled():
             raise JobCancelled()
         transcript = str(case.get("transcript") or "")
-        match = pattern.search(transcript) if pattern is not None else None
-        regex_hit = bool(match) if pattern is not None else None
+        human = case.get("humanResult") if case.get("reviewStatus", "REVIEWED") == "REVIEWED" else "UNKNOWN"
+        if human not in (VIOLATION, NORMAL) and not allow_unlabeled:
+            progress_state["done"] += 1
+            if progress:
+                progress(progress_state["done"], total)
+            return {**case, "humanResult": human, "transcript": transcript, "predicted": None, "correct": None,
+                    "excluded": True, "reviewRequired": True, "error": "",
+                    "regexHit": None, "semanticHit": None,
+                    "reason": "人工标签未知或未经复核，不参与计分和候选生成"}
+        role_valid = role_context_valid(rule, transcript)
+        try:
+            evidence = regex_evidence(rule, transcript) if pattern is not None else None
+        except RegexTimeout as exc:
+            raise EvaluationError(str(exc), [{"callId": case.get("callId"), "error": str(exc)}]) from exc
+        regex_hit = bool(evidence) if pattern is not None else None
         if pattern is None:
             regex_reason = "未配置正则"
-        elif match:
-            regex_reason = f"正则命中「{match.group(0)[:60]}」"
+        elif evidence:
+            regex_reason = f"正则命中「{evidence['text'][:60]}」"
         else:
             regex_reason = "正则未命中"
         if flags["semantic"]:
-            need_semantic = force_parts or (
+            need_semantic = workflow == "COMPLAINT_RESPONSE" or force_parts or not flags["regex"] or (
                 (logic == "OR" and not regex_hit) or (logic == "AND" and bool(regex_hit))
             )
         else:
@@ -110,18 +159,24 @@ async def evaluate_rule(
         semantic_hit: Optional[bool] = None
         reason = ""
         error = ""
-        if need_semantic:
+        judgment = {}
+        if need_semantic and role_valid:
             reason_scope = "reason" if with_reason else "verdict"
             key = hashlib.sha1(
-                (cache_scope + "\x00" + semantic_text + "\x00" + transcript + "\x00" + reason_scope).encode("utf-8")
+                (cache_scope + "\x00" + json.dumps(
+                    rule,
+                    ensure_ascii=False, sort_keys=True,
+                ) + "\x00" + transcript + "\x00" + json.dumps(
+                    {k: case.get(k) for k in ("transcriptComplete", "transcriptTruncated", "truncated")}, sort_keys=True
+                ) + "\x00" + reason_scope).encode("utf-8")
             ).hexdigest()
             cached = cache.get(key)
             if cached is not None:
-                semantic_hit, reason = cached
+                judgment = _judgment(cached)
             else:
                 try:
-                    semantic_hit, reason = await judge(case, rule)
-                    cache[key] = (semantic_hit, reason)
+                    judgment = _judgment(await judge(case, rule))
+                    cache[key] = copy.deepcopy(judgment)
                 except JobCancelled:
                     raise
                 except Exception as exc:  # noqa: BLE001
@@ -129,11 +184,19 @@ async def evaluate_rule(
                     error = str(exc)[:500]
                     error_samples.append({"callId": str(case.get("callId") or ""), "error": error})
                     semantic_hit = None
+            semantic_hit = judgment.get("violation")
+            reason = str(judgment.get("reason") or "")
             progress_state["semantic"] += 1
+        if not role_valid:
+            reason = "无法确认规则要求的说话角色或话轮，转人工复核"
+            judgment = {"reviewRequired": True, "evidenceValid": False, "evidenceErrors": [reason]}
         semantic_reason = reason if with_reason else ""
 
-        if error:
+        if not role_valid or error or (need_semantic and (semantic_hit is None or judgment.get("reviewRequired")
+                                       or judgment.get("evidenceValid") is False)):
             predicted: Optional[bool] = None
+        elif workflow == "COMPLAINT_RESPONSE":
+            predicted = semantic_hit
         elif flags["regex"] and flags["semantic"]:
             predicted = (bool(regex_hit) or bool(semantic_hit)) if logic == "OR" else (bool(regex_hit) and bool(semantic_hit))
         elif flags["regex"]:
@@ -141,7 +204,6 @@ async def evaluate_rule(
         else:
             predicted = bool(semantic_hit)
 
-        human = case.get("humanResult")
         correct: Optional[bool] = None
         if predicted is not None and human in (VIOLATION, NORMAL):
             correct = predicted == (human == VIOLATION)
@@ -151,17 +213,25 @@ async def evaluate_rule(
         return {
             "id": case.get("id"),
             "callId": case.get("callId"),
+            "split": case.get("split", "TRAIN"),
             "transcript": transcript,
             "autoResult": case.get("autoResult"),
             "humanResult": human,
             "regexHit": regex_hit,
             "regexReason": regex_reason,
+            "regexEvidence": {**evidence, "text": evidence["text"][:120]} if evidence else None,
             "semanticHit": semantic_hit,
             "semanticReason": semantic_reason,
             "predicted": predicted,
             "correct": correct,
             "reason": semantic_reason,
             "error": error,
+            "evidence": judgment.get("evidence", []), "steps": judgment.get("steps", {}),
+            "evidenceValid": judgment.get("evidenceValid", True),
+            "evidenceErrors": judgment.get("evidenceErrors", []),
+            "responseWindow": judgment.get("responseWindow"),
+            "humanEvidence": case.get("humanEvidence", []), "humanSteps": case.get("humanSteps", {}),
+            "reviewRequired": predicted is None,
         }
 
     rows = []
@@ -194,18 +264,14 @@ async def evaluate_rule(
         )
         raise EvaluationError(message, details=details)
     metrics = _metrics(rows)
-    if metrics["total"] == 0:
-        raise EvaluationError("没有可计分的样本：请确认人工复核结果包含违规和正常两类")
     return {
-        "rule": {
-            "regex": rule.get("regex") or "",
-            "semantic": semantic_text,
-            "logic": logic,
-        },
+        "rule": copy.deepcopy(rule),
         "metrics": metrics,
         "rows": rows,
         "errors": errors,
-        "coverage": round(metrics["total"] / len(cases), 4),
+        "coverage": metrics["coverage"],
+        "excludedUnknown": metrics["excludedUnknown"],
+        "complete": metrics["coverage"] == 1 and metrics["total"] > 0,
         "durationMs": int((time.time() - started) * 1000),
         "evaluatedAt": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }

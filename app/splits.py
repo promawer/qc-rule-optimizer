@@ -1,96 +1,89 @@
-"""按规则分层切分训练 / 验证 / 测试集。
+"""全局同源分组切分；一通电话在所有规则下只属于同一个集合。
 
-每条规则独立切分：同一通电话对 R001 可能属于训练集，对 R003 可能属于测试集。
-这样每条规则的三个集合都能尽量包含违规和正常样本，也避免某条规则的正样本
-被其它规则的数据切分“挤”到同一个集合里。
+分组依据显式 groupId 和去时间戳、空白后的相同转写文本，按组哈希进行
+60/20/20 分配。普通追加不移动已有组；合并此前分离的同源组会重新确定
+组的分配，必须由数据版本记录这次变更。小样本不人为补齐集合或复制样本。
 """
 from __future__ import annotations
 
 import hashlib
+import re
+import unicodedata
 from typing import Any, Dict, List
 
 TRAIN = "TRAIN"
 VALIDATION = "VALIDATION"
 TEST = "TEST"
 SPLITS = (TRAIN, VALIDATION, TEST)
-
 SPLIT_LABELS = {TRAIN: "训练集", VALIDATION: "验证集", TEST: "测试集"}
+SPLIT_POLICY = "global-group-sha256-v1"
 
 
-def _key(item: Dict[str, Any]) -> str:
-    return hashlib.sha1(str(item.get("callId") or "").encode("utf-8")).hexdigest()
+def normalized_transcript(text: str) -> str:
+    """保留角色和正文；仅清除不应导致同一转写被拆开的格式噪音。"""
+    text = unicodedata.normalize("NFKC", str(text or "")).lower()
+    text = re.sub(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}", "", text)
+    text = re.sub(r"\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?", "", text)
+    return re.sub(r"[\s\[\](){}]+", "", text)
 
 
-def _allocate(items: List[Dict[str, Any]], ratios=(0.6, 0.2, 0.2)) -> Dict[str, str]:
-    total = len(items)
-    if total == 0:
-        return {}
-    if total < 5:
-        return {item["callId"]: TRAIN for item in items}
+def group_calls(calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """并查集合并显式同源组及完全相同的规范化转写，包含传递关联。"""
+    parent = list(range(len(calls)))
 
-    test_size = max(1, int(round(total * ratios[2])))
-    validation_size = max(1, int(round(total * ratios[1])))
-    train_size = total - test_size - validation_size
-    if train_size < 1:
-        train_size = 1
-        test_size = max(1, total - validation_size - train_size)
-    capacity = {TRAIN: train_size, VALIDATION: validation_size, TEST: test_size}
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
 
-    positives = sorted([i for i in items if i.get("humanResult") == "VIOLATION"], key=_key)
-    negatives = sorted([i for i in items if i.get("humanResult") != "VIOLATION"], key=_key)
-    assigned: Dict[str, List[Dict[str, Any]]] = {TRAIN: [], VALIDATION: [], TEST: []}
+    def union(left: int, right: int) -> None:
+        parent[find(right)] = find(left)
 
-    def place(item: Dict[str, Any], split: str) -> bool:
-        if len(assigned[split]) < capacity[split]:
-            assigned[split].append(item)
-            return True
-        return False
+    seen: Dict[str, int] = {}
+    keys: List[List[str]] = []
+    for index, call in enumerate(calls):
+        tokens = []
+        group_id = str(call.get("groupId") or "").strip()
+        normalized = normalized_transcript(call.get("transcript") or "")
+        if group_id:
+            tokens.append("group:" + group_id)
+        if normalized:
+            tokens.append("text:" + hashlib.sha256(normalized.encode("utf-8")).hexdigest())
+        if not tokens:
+            tokens.append("call:" + str(call.get("callId") or call.get("id") or index))
+        keys.append(tokens)
+        for token in tokens:
+            if token in seen:
+                union(index, seen[token])
+            else:
+                seen[token] = index
 
-    def place_any(item: Dict[str, Any], order=SPLITS) -> None:
-        for split in order:
-            if place(item, split):
-                return
-        assigned[TRAIN].append(item)
-
-    for split in (TRAIN, VALIDATION, TEST):
-        if positives:
-            place_any(positives.pop(0), (split,))
-    for split in (TEST, VALIDATION):
-        if negatives:
-            place_any(negatives.pop(0), (split,))
-    for item in positives:
-        place_any(item, (TRAIN, VALIDATION, TEST))
-    for item in negatives:
-        place_any(item, (TRAIN, VALIDATION, TEST))
-
-    mapping: Dict[str, str] = {}
-    for split, group in assigned.items():
-        for item in group:
-            mapping[item["callId"]] = split
-    for item in items:
-        mapping.setdefault(item["callId"], TRAIN)
-    return mapping
-
-
-def build_splits(rules: List[Dict[str, Any]], calls: List[Dict[str, Any]]) -> Dict[str, Dict[str, str]]:
-    result: Dict[str, Dict[str, str]] = {}
-    for rule in rules:
-        code = str(rule.get("code") or "")
-        if not code:
-            continue
-        items = [
-            {
-                "callId": call.get("callId"),
-                "humanResult": "VIOLATION" if code in (call.get("humanRules") or []) else "NORMAL",
-            }
-            for call in calls
-        ]
-        result[code] = _allocate(items)
+    components: Dict[int, List[int]] = {}
+    for index in range(len(calls)):
+        components.setdefault(find(index), []).append(index)
+    result = []
+    for indices in components.values():
+        tokens = {token for index in indices for token in keys[index]}
+        explicit = sorted(token for token in tokens if token.startswith("group:"))
+        anchor = explicit[0] if explicit else min(tokens)
+        result.append({"groupKey": anchor, "calls": [calls[index] for index in indices]})
     return result
 
 
+def build_splits(rules: List[Dict[str, Any]], calls: List[Dict[str, Any]]) -> Dict[str, Dict[str, str]]:
+    mapping: Dict[str, str] = {}
+    for group in group_calls(calls):
+        digest = hashlib.sha256((SPLIT_POLICY + ":" + group["groupKey"]).encode("utf-8")).hexdigest()
+        bucket = int(digest[:8], 16) % 10000
+        split = TRAIN if bucket < 6000 else VALIDATION if bucket < 8000 else TEST
+        for call in group["calls"]:
+            mapping[str(call.get("callId") or "")] = split
+    return {str(rule["code"]): dict(mapping) for rule in rules if rule.get("code")}
+
+
 def split_cases(cases: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
-    result = {split: [] for split in SPLITS}
+    result: Dict[str, List[Dict[str, Any]]] = {split: [] for split in SPLITS}
     for case in cases:
         split = case.get("split") if case.get("split") in SPLITS else TRAIN
         result[split].append(case)
@@ -102,9 +95,13 @@ def split_summary(cases: List[Dict[str, Any]]) -> Dict[str, Any]:
     summary = {}
     for split in SPLITS:
         items = grouped[split]
+        reviewed = [c for c in items if c.get("humanResult") in ("VIOLATION", "NORMAL")
+                    and c.get("reviewStatus", "REVIEWED") == "REVIEWED"]
         summary[split] = {
             "total": len(items),
-            "positives": sum(1 for c in items if c.get("humanResult") == "VIOLATION"),
-            "negatives": sum(1 for c in items if c.get("humanResult") == "NORMAL"),
+            "reviewed": len(reviewed),
+            "unknown": len(items) - len(reviewed),
+            "positives": sum(1 for c in reviewed if c.get("humanResult") == "VIOLATION"),
+            "negatives": sum(1 for c in reviewed if c.get("humanResult") == "NORMAL"),
         }
     return summary

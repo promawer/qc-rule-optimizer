@@ -3,20 +3,20 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>质检规则优化台</title>
-  <link rel="stylesheet" href="/static/style.css?v=2.6.2" />
+  <title>质检能力自进化工作台</title>
+  <link rel="stylesheet" href="/static/style.css?v=3.0.0" />
 </head>
 <body>
   <header class="topbar">
     <div class="brand">
       <div class="logo">QC</div>
       <div>
-        <h1>质检规则优化台</h1>
-        <p>导入通话与人工复核结果，让大模型把选中的规则优化到目标准确率</p>
+        <h1>质检能力自进化工作台</h1>
+        <p>从人工证据提炼经验，以独立评测验证能力，按冻结版本审核与发布</p>
       </div>
     </div>
     <div class="top-actions">
-      <span id="buildTag" class="muted" style="font-size:12px">v2.6.2</span>
+      <span id="buildTag" class="muted" style="font-size:12px">v3.0.0</span>
       <span id="modeBadge" class="badge badge-mock">模拟演示</span>
       <button id="settingsBtn" class="btn ghost" type="button">模型设置</button>
     </div>
@@ -35,7 +35,7 @@
       <input id="ruleSearch" class="search" placeholder="搜索规则名称" />
       <div id="ruleList" class="rule-list"></div>
       <div class="sidebar-foot">
-        每条规则由「正则」「语义」组成，按 OR / AND 组合；命中即判定违规。<br />
+        单项规则按角色执行正则与语义；投诉回应流程联合核验客户意图、坐席回应和先后顺序。<br />
         导入格式：规则编号、规则名词、关键词、规则语义、规则内容的逻辑关系。
       </div>
     </aside>
@@ -57,6 +57,7 @@
         <button class="tab" data-tab="optimize" type="button">3. 智能优化</button>
         <button class="tab" data-tab="prompt" type="button">4. 通用提示词</button>
         <button class="tab" data-tab="jobs" type="button">5. 任务中心 <span id="jobsBadge" class="badge badge-live" hidden></span></button>
+        <button class="tab" data-tab="governance" type="button">6. 知识与发布</button>
       </nav>
 
       <!-- ============ 规则配置 ============ -->
@@ -90,6 +91,12 @@
               <span>语义描述 <em class="muted">给大模型判断用的违规条件，可为空</em></span>
               <textarea id="ruleSemantic" rows="4" placeholder="例如：坐席是否主动索要客户手机收到的短信验证码；提醒客户不要泄露不算。"></textarea>
             </label>
+            <label><span>判断对象</span><select id="ruleActor"><option value="AGENT">坐席行为</option><option value="CUSTOMER">客户表达</option><option value="BOTH">双方交互</option></select></label>
+            <label><span>判断流程</span><select id="ruleWorkflow"><option value="SIMPLE">单项规则判断</option><option value="COMPLAINT_RESPONSE">投诉意图 → 回应充分性 → 及时性</option></select></label>
+            <label><span>投诉后的回应窗口（话轮）</span><input id="responseWindowTurns" type="number" min="1" max="50" value="3" /></label>
+            <label><span>已批准专家知识（可多选）</span><select id="ruleKnowledge" multiple size="3"></select></label>
+            <label class="full"><span>回应要求（由业务定义）</span><textarea id="responseRequirement" rows="2">回应客户具体诉求，并提供解释、处置或适当安抚</textarea></label>
+            <p class="hint full">投诉流程会核验客户与坐席证据及先后顺序，正则仅作线索。无法确认角色或回应窗口不完整时转人工复核。保存的是开发草稿，运行版本由「知识与发布」单独管理。</p>
             <label class="full">
               <span>本次修改理由 <em class="muted">修改正则 / 语义 / 逻辑时必填，会写入修改历史</em></span>
               <textarea id="ruleChangeReason" rows="2" placeholder="例如：补充“动态密码”同义表达，减少漏报；同时排除“不要泄露”等提醒场景。"></textarea>
@@ -137,7 +144,7 @@
           <p class="hint">
             支持 CSV / JSON / XLSX，四列：<b>通话ID</b>、<b>通话文本</b>、<b>自动违规规则</b>、<b>人工违规规则</b>。
             规则列填规则编号（多条用 <code>;</code> 或 <code>、</code> 分隔），没有违规就留空。
-            同一通电话会按人工违规规则拆成每条规则的样本：编号在人工列中即「违规」，否则「正常」。
+            可增加「已复核规则」列。明确标出的违规保留；未声明已复核的其他规则为「未知」，不参与优化。所有规则共享同源分组切分。
           </p>
           <div class="import-row">
             <input id="fileInput" type="file" accept=".csv,.json,.xlsx,.txt" />
@@ -147,24 +154,35 @@
             </select>
             <button id="uploadBtn" class="btn primary" type="button">导入</button>
           </div>
+          <label class="hint"><input id="fullyReviewed" type="checkbox" /> 我确认本文件已完整复核当前全部规则，未列出的规则可标记为正常</label>
           <div id="importReport" class="report" hidden></div>
         </div>
 
         <div class="card">
           <div class="card-head">
-            <h3>数据预览</h3>
+            <h3>数据预览</h3><button id="annotateBtn" class="btn small ghost" type="button">复核标注</button>
             <span id="datasetCount" class="muted"></span>
           </div>
           <div id="datasetTable" class="table-wrap"></div>
           <p class="hint">
             「自动是否正确」= 当前规则编号在「自动违规规则」和「人工违规规则」中的命中结果是否一致；
-            两边都没有该编号，也算正确（都认为该规则未违规）。
+            只有明确人工标签的记录才计分；未知标签不计入准确率。点击「复核标注」可补充结论和证据。
           </p>
         </div>
       </div>
 
       <!-- ============ 智能优化 ============ -->
       <div class="tab-panel hidden" id="tab-optimize">
+        <div class="card"><h3>业务验收约束</h3><p class="hint">目标与约束固定在实验快照中。覆盖率必须为100%；独立发布验收每类至少5条，模拟结果不具备发布资格。</p>
+          <div class="form-grid compact">
+            <label><span>最低召回率（%）</span><input id="minRecall" type="number" min="0" max="100" value="90" /></label>
+            <label><span>最高误报率（%）</span><input id="maxFpr" type="number" min="0" max="100" value="10" /></label>
+            <label><span>验证/测试每类最少样本</span><input id="minPerClass" type="number" min="1" max="10000" value="5" /></label>
+            <label><span>漏报成本权重</span><input id="fnCost" type="number" min="0.1" max="10000" value="5" step="0.1" /></label>
+            <label><span>误报成本权重</span><input id="fpCost" type="number" min="0.1" max="10000" value="1" step="0.1" /></label>
+            <label><span>连续无改善停止轮数</span><input id="patience" type="number" min="1" max="10" value="2" /></label>
+          </div>
+        </div>
         <div class="two-col">
           <div class="card">
             <h3>优化目标</h3>
@@ -310,9 +328,20 @@
           <div class="card-head"><h3>说明</h3></div>
           <p class="hint">
             同一时间只允许一个任务运行。点击「查看详情」会切到该任务所属规则并打开运行面板；
-            「取消」会请求停止任务；「日志」可查看完整请求/响应日志。
+            「取消」会请求停止任务；「日志」可查看调用状态、耗时和错误信息。
           </p>
         </div>
+      </div>
+      <div class="tab-panel hidden" id="tab-governance">
+        <div class="card governance-intro"><div class="card-head"><h3>能力资产与发布闭环</h3><button id="refreshGovernanceBtn" class="btn ghost small">刷新</button></div>
+          <p>人工标注 → 候选经验 → 开发验证 → 冻结版本 → 独立验收 → 人工审核 → 影子/灰度/发布 → 反馈复核</p>
+          <p class="hint">此处管理本地运行时网关；外部业务需接入接口。署名审核用于本地协作留痕，尚未绑定企业身份。封存集不进入优化提示词，也不提供原文预览。</p>
+          <div id="governanceSummary"></div><div id="migrationWarnings"></div>
+        </div>
+        <div class="card"><div class="card-head"><h3>专家知识</h3><button id="newKnowledgeBtn" class="btn primary small">提炼候选经验</button></div><div id="knowledgeList"></div></div>
+        <div class="card"><div class="card-head"><h3>封存独立数据</h3><button id="importHoldoutBtn" class="btn ghost small">导入新独立集</button></div><div id="holdoutList"></div></div>
+        <div class="card"><div class="card-head"><h3>冻结版本与审核发布</h3><button id="freezeReleaseBtn" class="btn primary small">冻结候选</button></div><div id="releaseList"></div></div>
+        <div class="card"><div class="card-head"><h3>运行反馈与人工复核</h3><button id="newFeedbackBtn" class="btn ghost small">提交反馈</button></div><div id="feedbackList"></div></div>
       </div>
     </section>
   </main>
@@ -442,6 +471,7 @@
     </form>
   </dialog>
 
-  <script src="/static/app.js?v=2.6.2"></script>
+  <script src="/static/app.js?v=3.0.0"></script>
+  <script src="/static/governance.js?v=3.0.0"></script>
 </body>
 </html>

@@ -151,10 +151,19 @@
   }
 
   function markDirty() { state.dirty = true; }
+  function evaluationPolicy() {
+    return {minRecall: Number($("#minRecall").value)/100, maxFalsePositiveRate: Number($("#maxFpr").value)/100,
+      minPerClass: Number($("#minPerClass").value), fnCost: Number($("#fnCost").value),
+      fpCost: Number($("#fpCost").value), patience: Number($("#patience").value)};
+  }
+  window.QC = {state, api, esc, toast, loadRules, selectRule, setTab, loadDataset, loadRuns, withBusy};
 
   // ---------------------------------------------------------------- 启动
   document.addEventListener("DOMContentLoaded", () => {
     bindEvents();
+    ["ruleActor", "ruleWorkflow", "responseWindowTurns", "responseRequirement", "ruleKnowledge"].forEach(id => {
+      document.getElementById(id).addEventListener("change", markDirty);
+    });
     boot().catch((error) => toast(error.message, "error"));
   });
 
@@ -169,12 +178,15 @@
       clearRuleForm();
     }
     const initial = location.hash.replace("#", "");
-    if (["rule", "data", "optimize", "prompt", "jobs"].includes(initial)) setTab(initial);
+    if (["rule", "data", "optimize", "prompt", "jobs", "governance"].includes(initial)) setTab(initial);
     await loadJobs().catch(() => {});
     scheduleJobsRefresh(5000);
   }
 
   function bindEvents() {
+    $("#ruleWorkflow").addEventListener("change", () => {
+      if ($("#ruleWorkflow").value === "COMPLAINT_RESPONSE") $("#ruleActor").value = "BOTH";
+    });
     $("#settingsBtn").addEventListener("click", openSettings);
     $("#closeSettingsBtn").addEventListener("click", () => $("#settingsDialog").close());
     $("#saveSettingsBtn").addEventListener("click", saveSettings);
@@ -210,7 +222,7 @@
 
     window.addEventListener("hashchange", () => {
       const tab = location.hash.replace("#", "");
-      if (["rule", "data", "optimize", "prompt", "jobs"].includes(tab) && tab !== state.activeTab) setTab(tab);
+      if (["rule", "data", "optimize", "prompt", "jobs", "governance"].includes(tab) && tab !== state.activeTab) setTab(tab);
     });
 
     $("#tabs").addEventListener("click", (event) => {
@@ -377,6 +389,7 @@
           targetAccuracy: targetPct / 100,
           maxRounds,
           sampleLimit,
+          evaluationPolicy: evaluationPolicy(),
         }),
       });
       $("#batchStatus").textContent = "";
@@ -475,7 +488,13 @@
     $("#ruleRegex").value = rule.regex || "";
     $("#ruleSemantic").value = rule.semantic || "";
     $("#ruleLogic").value = rule.logic || "OR";
+    $("#ruleActor").value = rule.actor || "AGENT";
+    $("#ruleWorkflow").value = rule.workflow || "SIMPLE";
+    $("#responseWindowTurns").value = rule.responseWindowTurns || 3;
+    $("#responseRequirement").value = rule.responseRequirement || "回应客户具体诉求，并提供解释、处置或适当安抚";
+    window.QCGovernance?.populateKnowledge(rule);
     $("#ruleChangeReason").value = "";
+    if (rule.workflow === "COMPLAINT_RESPONSE") $("#ruleActor").value = "BOTH";
     $("#ruleVersion").textContent = `版本 v${rule.version} · 更新于 ${fmtTime(rule.updatedAt)}`;
     $("#deleteRuleBtn").hidden = false;
     renderChangeLog(rule);
@@ -497,6 +516,11 @@
     $("#ruleRegex").value = "";
     $("#ruleSemantic").value = "";
     $("#ruleLogic").value = "OR";
+    $("#ruleActor").value = "AGENT";
+    $("#ruleWorkflow").value = "SIMPLE";
+    $("#responseWindowTurns").value = 3;
+    $("#responseRequirement").value = "回应客户具体诉求，并提供解释、处置或适当安抚";
+    window.QCGovernance?.populateKnowledge({knowledgeIds: []});
     $("#ruleChangeReason").value = "";
     $("#ruleVersion").textContent = "";
     $("#changeLogCard").hidden = true;
@@ -555,6 +579,9 @@
       semantic: $("#ruleSemantic").value.trim(),
       logic: $("#ruleLogic").value,
       changeReason: $("#ruleChangeReason").value.trim(),
+      actor: $("#ruleActor").value, workflow: $("#ruleWorkflow").value,
+      responseWindowTurns: Number($("#responseWindowTurns").value), responseRequirement: $("#responseRequirement").value.trim(),
+      knowledgeIds: Array.from($("#ruleKnowledge").selectedOptions).map(o => o.value),
     };
     if (!payload.code) return toast("请填写规则编号，例如 R003", "error");
     if (!payload.name) return toast("请填写规则名称", "error");
@@ -650,6 +677,7 @@
       stat("通话总数", calls),
       stat(`本规则违规（${data.ruleCode || ""}）`, labels.VIOLATION || 0, "red"),
       stat("本规则正常", labels.NORMAL || 0, "green"),
+      stat("尚未复核", labels.UNKNOWN || 0),
       stat("本规则自动准确率", data.autoAccuracy == null ? "—" : pct(data.autoAccuracy), "blue"),
     ].join("");
     $("#datasetCount").textContent = `共 ${calls} 通通话；${splitText}；当前规则派生 ${data.total} 个样本${data.rows.length < data.total ? `（显示前 ${data.rows.length} 条）` : ""}`;
@@ -668,20 +696,20 @@
     $("#datasetTable").innerHTML = `<table>
       <thead><tr><th>通话ID</th><th>集合</th><th>本规则人工</th><th>本规则自动</th><th>本规则自动正确？</th><th>人工违规规则</th><th>自动违规规则</th><th>通话文本</th></tr></thead>
       <tbody>${data.rows.map((row) => {
-        const autoCorrect = row.autoResult === row.humanResult;
+        const autoCorrect = row.humanResult === "UNKNOWN" || row.autoResult === "UNKNOWN" ? null : row.autoResult === row.humanResult;
         return `<tr class="clickable">
           <td class="mono">${esc(row.callId)}</td>
           <td><span class="chip">${splitLabel[row.split] || "训练"}</span></td>
           <td>${labelPill(row.humanResult)}</td>
           <td>${labelPill(row.autoResult)}</td>
-          <td>${autoCorrect ? '<span class="pill pill-ok">正确</span>' : '<span class="pill pill-bad">错误</span>'}</td>
+          <td>${autoCorrect == null ? '<span class="pill pill-u">未计分</span>' : autoCorrect ? '<span class="pill pill-ok">正确</span>' : '<span class="pill pill-bad">错误</span>'}</td>
           <td class="mono">${codeText(row.humanRules)}</td>
           <td class="mono">${codeText(row.autoRules)}</td>
           <td class="transcript">${transcriptBlock(row.transcript)}</td>
         </tr>`;
       }).join("")}</tbody></table>
       <p class="hint">
-        「本规则人工 / 本规则自动」只看当前规则编号是否出现在人工/自动违规规则中；
+        「本规则人工」按稳定规则标注与复核状态读取；人工未知或自动未知时不计分；
         「本规则自动正确？」比较的也是当前这一条规则，不是两份全部规则列表是否完全相等。
         右侧两列展示整通电话的全部规则，其他规则的差异不影响本规则样本。
       </p>`;
@@ -694,6 +722,7 @@
     const form = new FormData();
     form.append("file", file);
     form.append("mode", $("#importMode").value);
+    form.append("fullyReviewed", $("#fullyReviewed").checked ? "true" : "false");
     const button = $("#uploadBtn");
     try {
       await withBusy(button, "导入中…", async () => {
@@ -762,8 +791,9 @@
   // ---------------------------------------------------------------- 页签
   function setTab(name) {
     state.activeTab = name;
+    if (name === "governance") window.QCGovernance?.refresh().catch(e => toast(e.message, "error"));
     $$("#tabs .tab").forEach((tab) => tab.classList.toggle("active", tab.dataset.tab === name));
-    ["rule", "data", "optimize", "prompt", "jobs"].forEach((key) => {
+    ["rule", "data", "optimize", "prompt", "jobs", "governance"].forEach((key) => {
       $(`#tab-${key}`).classList.toggle("hidden", key !== name);
     });
     if (location.hash !== `#${name}`) history.replaceState(null, "", `#${name}`);
@@ -797,7 +827,7 @@
     if (state.settings && state.settings.mode === "mock") {
       hint.textContent = `当前为模拟演示：不调用大模型，使用本地启发式算法；语义部分不参与判定。当前 ${total} 通通话。`;
     } else {
-      hint.textContent = `已就绪：${total} 通通话，将调用 ${state.settings.model} 迭代优化。`;
+      hint.textContent = `已就绪：${total} 通通话，将结合代表错例、正确对照和判定理由调用 ${state.settings.model} 优化。若修改通用提示词，会额外评测其他语义规则的验证集，样本不足或出现退步时不采纳。`;
     }
   }
 
@@ -831,6 +861,7 @@
               targetAccuracy: targetPct / 100,
               maxRounds,
               sampleLimit,
+          evaluationPolicy: evaluationPolicy(),
             }),
           });
       state.jobId = data.jobId;
@@ -1068,7 +1099,7 @@
       </div>`).join("");
     return `<div class="card gate-card">
       <div class="card-head">
-        <h3>泛化验收</h3>
+        <h3>开发验收 · ${esc(({IMPROVED:"确认提升",PASSED_BASELINE:"基线已达标，无需修改"})[gate.outcome] || "证据检查")}</h3>
         <span class="badge ${cls}">${label}</span>
       </div>
       <ul class="gate-reasons">${reasons}</ul>
@@ -1141,6 +1172,35 @@
     </div>`;
   }
 
+  function renderIterationContext(iteration) {
+    const summary = iteration.contextSummary;
+    const fields = { regex: "正则", semantic: "语义", logic: "逻辑", semanticPrompt: "通用提示词" };
+    const changed = (iteration.changedFields || []).map((field) => fields[field] || field).join("、");
+    const groups = summary ? Object.entries(summary.groups || {})
+      .map(([name, count]) => `${name}：${count} 条`).join("；") : "";
+    return `${summary ? `<details class="rationale"><summary>本轮依据：${summary.errorTotal} 条错误中选取 ${summary.selectedErrors} 条代表错例、${summary.selectedControls} 条正确对照</summary>
+      <p>错误分组（线索，需结合原文核实）：${esc(groups || "无")}</p>
+      <p>错例通话：${esc((summary.errorCallIds || []).join("、") || "无")}</p>
+      <p>正确对照：${esc((summary.controlCallIds || []).join("、") || "无")}</p></details>` : ""}
+      ${iteration.errorAnalysis ? `<div class="rationale"><b>错误原因假设：</b>${esc(iteration.errorAnalysis)}</div>` : ""}
+      ${iteration.preserveBehavior ? `<div class="rationale"><b>保留的正确边界：</b>${esc(iteration.preserveBehavior)}</div>` : ""}
+      ${iteration.changePlan ? `<div class="rationale"><b>本轮修改计划：</b>${esc(iteration.changePlan)}</div>` : ""}
+      ${changed ? `<div class="rationale"><b>实际修改：</b>${esc(changed)}</div>` : ""}
+      ${iteration.selectionReason ? `<div class="rationale"><b>采纳判断：</b>${esc(iteration.selectionReason)}</div>` : ""}`;
+  }
+
+  function renderPromptRegression(report) {
+    const label = { PASS: "通过", BLOCKED: "存在退步或评测失败", INSUFFICIENT: "样本不足" }[report.status] || report.status;
+    const checks = (report.checks || []).map((check) => {
+      const scores = check.baseline && check.candidate
+        ? `准确率 ${pct(check.baseline.accuracy)} → ${pct(check.candidate.accuracy)}，召回率 ${pct(check.baseline.recall)} → ${pct(check.candidate.recall)}` : "";
+      return `<li>${esc(check.code || "")}：${check.pass ? "通过" : "未通过"} ${esc(scores)} · ${esc(check.reason || "")}</li>`;
+    }).join("");
+    return `<div class="box"><h4>通用提示词跨规则回归 · ${esc(label)}</h4>
+      <p class="muted">使用其他语义规则的验证集；准确率、召回率不得下降，原正确样本不得变错。</p>
+      ${checks ? `<ul>${checks}</ul>` : `<p>${esc((report.reasons || []).join("；"))}</p>`}</div>`;
+  }
+
   function renderJobResult(job) {
     const container = $("#jobResult");
     let html = renderFlow(job) + renderErrorCard(job) + renderJobLogs(job);
@@ -1159,7 +1219,11 @@
     const gap = Math.abs((bestValidation.accuracy || 0) - (bestTest.accuracy || 0));
     const gate = job.gate;
 
+    if (job.simulated || job.mode === "mock") html += '<div class="card hint">模拟演示：语义未进行真实评测，结果不具备发布资格。</div>';
+    if (job.stopReason) html += `<div class="card"><b>停止原因：</b>${esc(({TARGET_REACHED:"达到业务目标", INCOMPLETE_EVALUATION:"评测未完成，先处理失败或待复核样本", NO_TRAIN_ERRORS:"训练集没有可用于修改的错误，请补充案例覆盖", PATIENCE_EXHAUSTED:"连续多轮没有改善", CANDIDATE_BUDGET_EXHAUSTED:"已达到候选预算"})[job.stopReason] || job.stopReason)}</div>`;
+    if (job.bestValidation) html += `<div class="card chip-row"><span class="chip">验证覆盖率 ${pct(job.bestValidation.coverage)}</span><span class="chip">有效判定准确率 ${pct(job.bestValidation.validAccuracy)}</span><span class="chip">未完成 ${job.bestValidation.unresolved || 0}</span><span class="chip">未复核排除 ${job.bestValidation.excludedUnknown || 0}</span><span class="chip">数据版本 ${job.datasetVersion || "—"}</span></div>`;
     if (gate) html += renderGate(gate);
+    if (job.promptRegression) html += renderPromptRegression(job.promptRegression);
 
     const splitRows = [
       ["TRAIN", "训练集", baselineTrain, bestTrain, summary.TRAIN],
@@ -1229,7 +1293,7 @@
           我已知晓泛化验收未通过（${esc((gate && gate.status) || "未知")}），仍要人工确认应用
         </label>`}
         <div class="form-actions">
-          <button class="btn primary" id="applyBtn" data-apply="${esc(job.id)}" ${disabled ? "disabled" : ""}>应用为当前规则</button>
+          <button class="btn primary" id="applyBtn" data-apply="${esc(job.id)}" ${disabled ? "disabled" : ""}>应用到开发草稿</button>
           ${!improved ? '<span class="muted">相对基线没有提升，不能应用</span>' : ""}
         </div>
         ${job.promptChanged ? `<p class="muted">本轮同时修改了通用语义提示词，应用后会更新所有规则共用的提示词。</p>
@@ -1253,7 +1317,7 @@
       }
       const badge = iteration.accepted
         ? '<span class="badge badge-accepted">已采纳</span>'
-        : '<span class="badge badge-rejected">未超过最优</span>';
+        : '<span class="badge badge-rejected">未采纳</span>';
       const metrics = iteration.metrics || {};
       const validation = iteration.validationMetrics || {};
       const promptBlock = iteration.promptChanged
@@ -1269,9 +1333,11 @@
           <span class="muted">耗时 ${((iteration.durationMs || 0) / 1000).toFixed(1)} 秒</span>
         </div>
         <div class="rationale"><b>修改理由：</b>${esc(iteration.rationale || "无修改说明")}</div>
+        ${renderIterationContext(iteration)}
         ${iteration.expectedEffect ? `<div class="expected">预期效果：${esc(iteration.expectedEffect)}</div>` : ""}
         <div class="compare">${compareBox("修改前", before)}${compareBox("修改后", after)}</div>
         ${promptBlock}
+        ${iteration.promptRegression ? renderPromptRegression(iteration.promptRegression) : ""}
         <div class="iteration-cases">
           <button class="btn small ghost" type="button" data-iter-cases="${esc(job.id)}" data-iter-index="${iteration.index}" data-iter-split="TRAIN">训练集逐条结果</button>
           <button class="btn small ghost" type="button" data-iter-cases="${esc(job.id)}" data-iter-index="${iteration.index}" data-iter-split="VALIDATION">验证集逐条结果</button>
@@ -1312,7 +1378,7 @@
             const regexReason = row.regexReason
               || (row.regexHit === true ? "正则命中" : row.regexHit === false ? "正则未命中" : "未配置正则");
             let semanticReason = row.semanticReason || "";
-            if (!data.withReason) semanticReason = "未生成（仅正则）";
+            if (!data.withReason && !row.steps?.complaintIntent) semanticReason = row.reason || "未生成补充说明";
             else if (!semanticReason) semanticReason = row.semanticHit == null ? "未调用语义" : "未生成";
             return `<tr class="clickable">
               <td class="mono">${esc(row.callId)}</td>
@@ -1320,7 +1386,7 @@
               <td>${predPill(row.predicted)}</td>
               <td>${result}</td>
               <td class="reason-cell">${esc(regexReason)}</td>
-              <td class="reason-cell">${esc(semanticReason)}</td>
+              <td class="reason-cell">${esc(semanticReason)}${window.QCGovernance?.evidenceHtml(row) || ""}</td>
               <td class="transcript">${transcriptBlock(row.transcript)}</td>
             </tr>`;
           }).join("")}</tbody>
@@ -1369,7 +1435,7 @@
         const regexReason = row.regexReason
           || (row.regexHit === true ? "正则命中" : row.regexHit === false ? "正则未命中" : "未配置正则");
         let semanticReason = row.semanticReason || "";
-        if (!state.caseWithReason) semanticReason = "未生成（仅正则）";
+        if (!state.caseWithReason && !Object.keys(row.steps || {}).length) semanticReason = row.reason || "未生成补充说明";
         else if (!semanticReason) semanticReason = row.semanticHit == null ? "未调用语义" : "未生成";
         return `<tr class="clickable">
           <td class="mono">${esc(row.callId)}</td>
@@ -1378,7 +1444,7 @@
           <td>${predPill(row.predicted)}</td>
           <td>${result}</td>
           <td class="reason-cell">${esc(regexReason)}</td>
-          <td class="reason-cell">${esc(semanticReason)}</td>
+          <td class="reason-cell">${esc(semanticReason)}${window.QCGovernance?.evidenceHtml(row) || ""}</td>
           <td class="transcript">${transcriptBlock(row.transcript)}</td>
         </tr>`;
       }).join("")}</tbody></table>`;
@@ -1398,7 +1464,7 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ reason, force }),
       });
-      toast("已应用为当前规则，修改理由已记录", "success");
+      toast("已应用到开发草稿，修改理由已记录", "success");
       state.dirty = false;
       await loadRules();
       await loadPrompt();
