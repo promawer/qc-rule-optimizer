@@ -265,7 +265,8 @@ class LLMClient:
                 "自定义接口请求模板没有包含 {{prompt}}、{{user}} 或 {{messages}}，"
                 "不会上送当前规则和通话文本；请改用 {{prompt}} 或单入参模板。"
             )
-        self._semaphore = asyncio.Semaphore(max(1, concurrency))
+        self._concurrency = max(1, concurrency)
+        self._semaphore = None
         timeout_value = float(self.config.get("timeoutSec") or timeout)
         self.timeout_value = timeout_value
         self.max_retries = max(0, min(10, int(self.config.get("maxRetries", 3) or 0)))
@@ -433,6 +434,8 @@ class LLMClient:
         attempts = self.max_retries + 1
         if use_json_mode:
             attempts = max(attempts, 2)
+        if self._semaphore is None:
+            self._semaphore = asyncio.Semaphore(self._concurrency)
         async with self._semaphore:
             if self.request_interval > 0 and self._last_call_started:
                 wait = self.request_interval - (time.monotonic() - self._last_call_started)

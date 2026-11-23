@@ -51,13 +51,28 @@ _lock = threading.Lock()
 
 def _close():
     global _process, _connection
-    if _connection is not None:
-        _connection.close()
-    if _process is not None:
-        if _process.is_alive():
-            _process.terminate()
-        _process.join(timeout=1)
-    _process = _connection = None
+    connection, process = _connection, _process
+    _connection = _process = None
+    if connection is not None:
+        try:
+            connection.close()
+        except OSError:
+            pass
+    if process is not None:
+        try:
+            if process.is_alive():
+                process.terminate()
+        except (AssertionError, ValueError):
+            pass
+        try:
+            if getattr(process, "_popen", None) is not None:
+                process.join(timeout=1)
+        except (AssertionError, ValueError):
+            pass
+        try:
+            process.close()
+        except (AttributeError, ValueError):
+            pass
 
 
 def safe_search(pattern, text, timeout=.25):
@@ -67,8 +82,14 @@ def safe_search(pattern, text, timeout=.25):
             _close()
             context = multiprocessing.get_context("spawn")
             parent, child = context.Pipe()
-            _process = context.Process(target=_worker, args=(child,), daemon=True)
-            _process.start()
+            process = context.Process(target=_worker, args=(child,), daemon=True)
+            try:
+                process.start()
+            except Exception:
+                parent.close()
+                child.close()
+                raise
+            _process = process
             child.close()
             _connection = parent
             if not parent.poll(5):
