@@ -29,7 +29,7 @@ def _sentence(text: str, words) -> str:
     return ""
 
 
-def _hit(code: str, name: str, semantic: str, agent_text: str) -> Tuple[bool, str]:
+def _hit(code: str, name: str, semantic: str, agent_text: str, logic: str = "OR") -> Tuple[bool, str]:
     text = agent_text or ""
     if code == "R001" or "辱骂" in name:
         if any(word in text for word in INSULTS):
@@ -42,6 +42,17 @@ def _hit(code: str, name: str, semantic: str, agent_text: str) -> Tuple[bool, st
             return True, f"坐席向客户承诺「{_sentence(text, GUARANTEE)}」"
         return False, "坐席未承诺保本、保证收益或零风险"
     if code == "R003" or "验证码" in name:
+        exclusions = [line for line in str(semantic or "").splitlines()
+                      if line.strip().startswith("排除：")]
+        for line in exclusions:
+            for term in ("不要", "不会", "切勿", "提醒"):
+                if term in line and term in text:
+                    return False, f"命中语义排除条件「{term}」，不构成索要"
+        if logic == "AND":
+            # 演示基线：语义模型过度触发，把“提醒验证码”也当成索要；后续靠排除条件逐步修正。
+            if any(word in text for word in CODE_WORDS):
+                return True, f"当前语义把「{_sentence(text, CODE_WORDS)}」识别为索要"
+            return False, "坐席发言未出现验证码或动态密码"
         if any(word in text for word in ("不要", "不会", "切勿", "提醒")) and any(
             word in text for word in CODE_WORDS
         ):
@@ -81,7 +92,8 @@ async def mock_judge(case: Dict[str, Any], rule: Dict[str, Any], with_reason: bo
         }
     await asyncio.sleep(0.06)
     hit, reason = _hit(str(rule.get("code") or ""), str(rule.get("name") or ""),
-                       str(rule.get("semantic") or ""), _agent_text(str(case.get("transcript") or "")))
+                       str(rule.get("semantic") or ""), _agent_text(str(case.get("transcript") or "")),
+                       str(rule.get("logic") or "OR"))
     return hit, reason if with_reason else ""
 
 

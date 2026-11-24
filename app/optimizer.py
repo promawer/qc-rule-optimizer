@@ -284,6 +284,7 @@ class MockProposer:
             or (r["predicted"] is False and r["humanResult"] == NORMAL)
         ]
         core = str(rule.get("regex") or "").strip()
+        code = str(rule.get("code") or "")
         fn_ids = [str(r.get("callId")) for r in rows if r.get("callId") in selected_ids
                   and r.get("predicted") is False and r.get("humanResult") == VIOLATION]
         fp_ids = [str(r.get("callId")) for r in rows if r.get("callId") in selected_ids
@@ -292,7 +293,7 @@ class MockProposer:
         reasons: List[str] = []
         diagnosis: Dict[str, Any] = {"errorClusters": [], "mustPreserve": [], "labelRisks": []}
 
-        if fn_texts:
+        if fn_texts and code != "R003":
             picked = _candidate_phrases(fn_texts, other_texts, limit=1)
             diagnosis["errorClusters"].append({
                 "type": "REGEX_FALSE_NEGATIVE" if core else "SEMANTIC_FALSE_NEGATIVE",
@@ -316,6 +317,44 @@ class MockProposer:
                         "reason": f"补充漏报中的语义条件「{phrase}」",
                     })
                     reasons.append(f"补充漏报语义「{phrase}」")
+
+        if code == "R003" and fp_texts:
+            diagnosis["errorClusters"].append({
+                "type": "SEMANTIC_FALSE_POSITIVE",
+                "caseIds": fp_ids[:5],
+                "rootCause": "语义把提醒泄露验证码误判成索要验证码",
+                "suggestedDirection": "逐类增加否定/提醒排除条件，保留真正的索要场景",
+            })
+            if str(rule.get("logic") or "OR") != "AND":
+                operations.append({
+                    "op": "SET_LOGIC", "value": "AND", "targetCaseIds": fp_ids[:5],
+                    "reason": "先要求正则和语义同时确认",
+                })
+                reasons.append("把逻辑改为 AND，避免正则单独命中")
+            else:
+                semantic = str(rule.get("semantic") or "")
+                for term in ("不要", "不会", "切勿", "提醒"):
+                    if any(term in text for text in fp_texts) and f"排除：" not in semantic:
+                        operations.append({
+                            "op": "ADD_SEMANTIC_EXCLUSION",
+                            "text": f"客户只是被提醒「{term}」泄露验证码，不是坐席索要",
+                            "targetCaseIds": fp_ids[:5],
+                            "reason": f"排除「{term}」提醒场景，逐步收紧语义",
+                        })
+                        reasons.append(f"增加「{term}」提醒场景的语义排除")
+                        break
+                    if any(term in text for text in fp_texts) and term not in "\n".join(
+                        line for line in semantic.splitlines() if line.strip().startswith("排除：")
+                    ):
+                        operations.append({
+                            "op": "ADD_SEMANTIC_EXCLUSION",
+                            "text": f"客户只是被提醒「{term}」泄露验证码，不是坐席索要",
+                            "targetCaseIds": fp_ids[:5],
+                            "reason": f"排除「{term}」提醒场景，逐步收紧语义",
+                        })
+                        reasons.append(f"增加「{term}」提醒场景的语义排除")
+                        break
+            fp_texts = []
 
         if fp_texts and core and str(rule.get("logic") or "OR") == "OR":
             diagnosis["errorClusters"].append({

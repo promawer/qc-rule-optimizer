@@ -57,7 +57,7 @@ STATIC_DIR = BASE_DIR / "static"
 JOB_LOG_DIR = BASE_DIR / ".run" / "jobs"
 JOB_LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="质检能力自进化工作台", version="3.0.2")
+app = FastAPI(title="质检能力自进化工作台", version="3.0.3")
 store = Store(Path(os.environ.get("QCO_STORE", str(STORE_PATH))))
 RUNTIME: Dict[str, str] = {"apiKey": os.environ.get("DEEPSEEK_API_KEY", "")}
 CHECKPOINT_DIR = store.path.parent / "job-checkpoints"
@@ -574,6 +574,9 @@ async def reset_demo_data() -> Dict[str, Any]:
 
     def mutate(state: Dict[str, Any]) -> Dict[str, Any]:
         state["calls"] = build_demo_calls()
+        for rule in state.get("rules") or []:
+            if str(rule.get("code") or "") == "R003":
+                rule["logic"] = "AND"
         _rebuild_splits(state)
         state["runs"] = []
         return {"ok": True, "calls": len(state["calls"])}
@@ -912,20 +915,25 @@ async def _execute_optimize(
             return await judge_semantic(llm, case, enrich_rule(state, other_rule), semantic_prompt,
                                         [enrich_rule(state, item) for item in regression_rules], False)
 
+        async def mock_prompt_guard(candidate, semantic_prompt):
+            return {"status": "PASS", "checks": [], "reasons": ["模拟模式跳过跨规则回归，仅演示本规则优化"]}
+
         policy = dict(job.get("policy") or {})
         if settings.get("mode") != "deepseek":
-            # 演示数据只有 10 通，按真实每类 5 条会永远无法验收；演示模式明确放宽到每类 1 条。
+            # 演示数据只有 40 通，按真实每类 5 条会永远无法验收；演示模式明确放宽到每类 1 条、
+            # 误报上限 15%，仅用于展示完整流程，不代表生产验收标准。
             policy["minPerClass"] = 1
+            policy["maxFalsePositiveRate"] = max(float(policy.get("maxFalsePositiveRate") or 0), 0.15)
             job["policy"] = policy
         result = await optimize(
             rule, cases, job["target"], job["maxRounds"],
             _make_judge_factory(llm, all_rules), proposer, prompt,
             emit=lambda event: _emit(job, event),
             is_cancelled=lambda: bool(job.get("cancelRequested")),
-            prompt_guard=make_prompt_guard(
+            prompt_guard=(make_prompt_guard(
                 state, rule, regression_judge, lambda event: _emit(job, event),
                 lambda: bool(job.get("cancelRequested")),
-            ),
+            ) if llm is not None else mock_prompt_guard),
             policy=policy,
         )
         job["status"] = result["status"]
