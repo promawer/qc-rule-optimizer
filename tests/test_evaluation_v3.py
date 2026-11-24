@@ -170,7 +170,7 @@ class SearchPolicyTests(unittest.TestCase):
         attempts = []
         async def proposer(rule, result, target, history, prompt):
             attempts.append(True)
-            return {"regex": "(" if len(attempts) == 1 else "风险", "semanticPrompt": prompt}
+            return {"regex": "(" if len(attempts) == 1 else "永不匹配|风险", "semanticPrompt": prompt}
         result = self.run_search({"regex": "永不匹配"}, proposer)
         self.assertEqual(result["iterations"][0]["rejectionCode"], "INVALID_CANDIDATE")
         self.assertTrue(result["iterations"][1]["accepted"])
@@ -202,7 +202,7 @@ class SearchPolicyTests(unittest.TestCase):
         async def proposer(rule, result, target, history, prompt):
             self.assertTrue(all(row["humanResult"] in (NORMAL, VIOLATION) for row in result["rows"]))
             self.assertNotIn("U", result["optimizationContext"]["summary"]["errorCallIds"])
-            return {"regex": "风险"}
+            return {"regex": "永不匹配|风险"}
         result = self.run_search({"regex": "永不匹配"}, proposer, cases)
         self.assertEqual(result["excludedUnknown"], 1)
         self.assertEqual(result["gate"]["status"], "PASS")
@@ -213,7 +213,7 @@ class SearchPolicyTests(unittest.TestCase):
             cases.extend(case(f"{split}p{i}", True, split, "风险") for i in range(5))
             cases.extend(case(f"{split}n{i}", False, split, "普通误报" if i < 10 else "普通") for i in range(45))
         async def proposer(rule, result, target, history, prompt):
-            return {"regex": "不命中", "semanticPrompt": prompt}
+            return {"regex": "风险x|误报", "semanticPrompt": prompt}
         result = self.run_search({"regex": "风险|误报"}, proposer, cases)
         self.assertFalse(result["iterations"][0]["accepted"])
         self.assertIn("召回", result["iterations"][0]["selectionReason"])

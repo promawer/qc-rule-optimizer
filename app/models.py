@@ -41,7 +41,7 @@ class RuleInput(BaseModel):
     code: str = Field(min_length=1, max_length=20)
     name: str = Field(min_length=1, max_length=60)
     description: str = Field(default="", max_length=500)
-    regex: str = Field(default="", max_length=2000)
+    regex: str = Field(default="", max_length=300)
     semantic: str = Field(default="", max_length=1000)
     logic: Literal["OR", "AND"] = "OR"
     actor: Literal["AGENT", "CUSTOMER", "BOTH"] = "AGENT"

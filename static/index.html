@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>质检能力自进化工作台</title>
-  <link rel="stylesheet" href="/static/style.css?v=3.0.0" />
+  <link rel="stylesheet" href="/static/style.css?v=3.0.1" />
 </head>
 <body>
   <header class="topbar">
@@ -16,7 +16,7 @@
       </div>
     </div>
     <div class="top-actions">
-      <span id="buildTag" class="muted" style="font-size:12px">v3.0.0</span>
+      <span id="buildTag" class="muted" style="font-size:12px">v3.0.1</span>
       <span id="modeBadge" class="badge badge-mock">模拟演示</span>
       <button id="settingsBtn" class="btn ghost" type="button">模型设置</button>
     </div>
@@ -84,8 +84,8 @@
               <input id="ruleDesc" maxlength="500" placeholder="这条规则要防止什么问题" />
             </label>
             <label class="full">
-              <span>正则表达式 <em class="muted">Python re 语法，可为空</em></span>
-              <textarea id="ruleRegex" rows="4" spellcheck="false" placeholder="例如：验证码|动态密码"></textarea>
+              <span>正则表达式 <em class="muted">Python re 语法，最多 300 字符；优化时每轮仅局部修改并自动去重</em></span>
+              <textarea id="ruleRegex" rows="4" maxlength="300" spellcheck="false" placeholder="例如：验证码|动态密码"></textarea>
             </label>
             <label class="full">
               <span>语义描述 <em class="muted">给大模型判断用的违规条件，可为空</em></span>
@@ -471,7 +471,7 @@
     </form>
   </dialog>
 
-  <script src="/static/app.js?v=3.0.0"></script>
-  <script src="/static/governance.js?v=3.0.0"></script>
+  <script src="/static/app.js?v=3.0.1"></script>
+  <script src="/static/governance.js?v=3.0.1"></script>
 </body>
 </html>

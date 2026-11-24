@@ -171,7 +171,7 @@ class IterationStrategyTest(unittest.TestCase):
                 context = result["optimizationContext"]
                 test.assertTrue(all(s["callId"].startswith(TRAIN) for s in context["errors"] + context["controls"]))
                 test.assertEqual(rule["code"], "R1")
-                return {"regex": "风险", "semantic": "", "logic": "OR", "rationale": "补充表达",
+                return {"regex": "永不命中|风险", "semantic": "", "logic": "OR", "rationale": "补充表达",
                         "semanticPrompt": prompt + "\n新" if change_prompt else prompt}
         async def judge(case, rule):
             return False, ""

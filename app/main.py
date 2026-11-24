@@ -44,6 +44,7 @@ from .experiments import freeze_experiment, checkpoint, restore_jobs, code_finge
 from .capabilities import regex_evidence, role_context_valid
 from .regex_safety import RegexTimeout
 from .optimizer import LLMProposer, MockProposer, optimize
+from .regex_policy import MAX_REGEX_LENGTH
 from .prompts import DEFAULT_SEMANTIC_PROMPT, render_prompt, validate_prompt
 from .prompt_regression import context_fingerprint, make_prompt_guard, rules_with_candidate
 from .rule_importer import parse_rule_file
@@ -54,7 +55,7 @@ STATIC_DIR = BASE_DIR / "static"
 JOB_LOG_DIR = BASE_DIR / ".run" / "jobs"
 JOB_LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="质检能力自进化工作台", version="3.0.0")
+app = FastAPI(title="质检能力自进化工作台", version="3.0.1")
 store = Store(Path(os.environ.get("QCO_STORE", str(STORE_PATH))))
 RUNTIME: Dict[str, str] = {"apiKey": os.environ.get("DEEPSEEK_API_KEY", "")}
 CHECKPOINT_DIR = store.path.parent / "job-checkpoints"
@@ -216,7 +217,7 @@ async def health() -> Dict[str, Any]:
     settings = store.settings()
     return {
         "status": "ok",
-        "version": "3.0.0",
+        "version": app.version,
         "datasetVersion": state.get("datasetVersion", 1),
         "deploymentScope": "LOCAL_GATEWAY",
         "mode": settings.get("mode", "mock"),
@@ -431,6 +432,12 @@ async def import_rules(
         if parsed["errors"]:
             detail += "：\n" + "\n".join(parsed["errors"][:20])
         raise HTTPException(status_code=400, detail=detail)
+    too_long = [
+        f"{item['code']} 的正则 {len(item['regex'])} 字符，超过 {MAX_REGEX_LENGTH} 字符上限"
+        for item in parsed["rules"] if len(item.get("regex") or "") > MAX_REGEX_LENGTH
+    ]
+    if too_long:
+        raise HTTPException(status_code=400, detail="；".join(too_long[:20]))
     import_reason = (reason or "").strip()[:500] or "规则文件导入"
 
     def mutate(state: Dict[str, Any]) -> Dict[str, Any]:

@@ -825,9 +825,9 @@
       return;
     }
     if (state.settings && state.settings.mode === "mock") {
-      hint.textContent = `当前为模拟演示：不调用大模型，使用本地启发式算法；语义部分不参与判定。当前 ${total} 通通话。`;
+      hint.textContent = `当前为模拟演示：不调用大模型，使用本地启发式算法；语义部分不参与判定。当前 ${total} 通通话。正则最多 300 字符，每轮仅做局部修改。`;
     } else {
-      hint.textContent = `已就绪：${total} 通通话，将结合代表错例、正确对照和判定理由调用 ${state.settings.model} 优化。若修改通用提示词，会额外评测其他语义规则的验证集，样本不足或出现退步时不采纳。`;
+      hint.textContent = `已就绪：${total} 通通话，将结合代表错例、正确对照和判定理由调用 ${state.settings.model} 优化。正则最多 300 字符，每轮仅做局部修改、系统会自动去重；若修改通用提示词，会额外评测其他语义规则的验证集，样本不足或出现退步时不采纳。`;
     }
   }
 
@@ -1349,6 +1349,7 @@
           <span class="chip">验证召回率 ${pct(validation.recall)}</span>
           <span class="chip">验证误报 ${validation.fp}</span>
           <span class="chip">验证漏报 ${validation.fn}</span>
+          <span class="chip">正则长度 ${String((iteration.rule || {}).regex || "").length} / 300</span>
           <span class="chip">${iteration.source === "mock" ? "本地启发式" : "大模型"}</span>
         </div>
       </div>`;
