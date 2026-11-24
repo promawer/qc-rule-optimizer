@@ -258,6 +258,7 @@
     });
 
     $("#uploadBtn").addEventListener("click", uploadDataset);
+    $("#demoDataBtn").addEventListener("click", resetDemoData);
     $("#exportLink").addEventListener("click", (event) => event.stopPropagation());
 
     $("#startBtn").addEventListener("click", () => startJob("optimize"));
@@ -284,6 +285,16 @@
           iterButton.dataset.iterCases,
           iterButton.dataset.iterIndex,
           iterButton.dataset.iterSplit,
+          area
+        );
+        return;
+      }
+      const deltaButton = event.target.closest("[data-iter-delta]");
+      if (deltaButton) {
+        const area = deltaButton.closest(".iteration-cases").querySelector("[data-iter-delta-area]");
+        loadIterationDelta(
+          deltaButton.dataset.iterDelta,
+          deltaButton.dataset.iterIndex,
           area
         );
       }
@@ -715,6 +726,23 @@
       </p>`;
   }
 
+  async function resetDemoData() {
+    const ok = confirm("将用 40 通真实感演示通话替换当前通话数据，并清空运行记录。继续吗？");
+    if (!ok) return;
+    $("#demoDataStatus").textContent = "正在载入演示场景…";
+    try {
+      const result = await api("/api/demo/reset", { method: "POST" });
+      $("#demoDataStatus").textContent = "";
+      toast(`已载入 ${result.calls} 通演示数据`, "success");
+      await loadRules();
+      await loadDataset();
+      await loadRuns().catch(() => {});
+    } catch (error) {
+      $("#demoDataStatus").textContent = error.message;
+      toast(error.message, "error");
+    }
+  }
+
   async function uploadDataset() {
     if (!state.currentId) return toast("请先保存规则", "error");
     const file = $("#fileInput").files[0];
@@ -825,7 +853,7 @@
       return;
     }
     if (state.settings && state.settings.mode === "mock") {
-      hint.textContent = `当前为模拟演示：不调用大模型，使用本地启发式算法；语义部分不参与判定。当前 ${total} 通通话。正则最多 300 字符，每轮仅做局部修改。`;
+      hint.textContent = `当前为模拟演示：不调用大模型，使用本地语义模拟和编辑候选；演示数据 10 通，为展示流程按每类 1 条验收；真实模式仍是每类 5 条。当前 ${total} 通通话。正则最多 300 字符，每轮仅做局部修改。`;
     } else {
       hint.textContent = `已就绪：${total} 通通话，将结合代表错例、正确对照和判定理由调用 ${state.settings.model} 优化。正则最多 300 字符，每轮仅做局部修改、系统会自动去重；若修改通用提示词，会额外评测其他语义规则的验证集，样本不足或出现退步时不采纳。`;
     }
@@ -1304,6 +1332,34 @@
     container.innerHTML = html;
   }
 
+  function renderDiagnosis(diagnosis) {
+    const clusters = (diagnosis && diagnosis.errorClusters) || [];
+    if (!clusters.length) return "";
+    return `<div class="diagnosis">
+      <b>本轮诊断</b>
+      ${clusters.map((item) => `<div class="diagnosis-row">
+        <span class="badge badge-mock">${esc(item.type || "ERROR")}</span>
+        <span>${esc(item.rootCause || "")}</span>
+        <span class="muted">${esc((item.caseIds || []).join("、"))}</span>
+      </div>`).join("")}
+    </div>`;
+  }
+
+  function renderOperations(operations) {
+    if (!operations || !operations.length) {
+      return '<div class="muted">本轮没有结构化编辑操作（兼容旧候选）</div>';
+    }
+    return `<div class="operation-list"><b>结构化编辑</b>${operations.map((op) => {
+      const value = op.pattern || op.text || (op.old ? `${op.old} → ${op.new}` : "") || op.value || "";
+      return `<div class="operation-row">
+        <span class="mono">${esc(op.op)}</span>
+        <span class="mono">${esc(value)}</span>
+        <span class="muted">${esc((op.targetCaseIds || []).join("、"))}</span>
+        <span>${esc(op.reason || "")}</span>
+      </div>`;
+    }).join("")}</div>`;
+  }
+
   function renderIterations(job) {
     let previous = job.baselineRule || {};
     let previousPrompt = job.baselinePrompt || "";
@@ -1320,6 +1376,21 @@
         : '<span class="badge badge-rejected">未采纳</span>';
       const metrics = iteration.metrics || {};
       const validation = iteration.validationMetrics || {};
+      const probe = iteration.probe;
+      const critic = iteration.critic;
+      const delta = iteration.caseDelta;
+      const probeBadge = probe
+        ? `<span class="badge ${probe.passed ? "badge-ok" : "badge-fail"}">探针${probe.passed ? "通过" : "未通过"}</span>`
+        : '<span class="badge">未跑探针</span>';
+      const criticBadge = critic
+        ? `<span class="badge ${critic.status === "PASS" ? "badge-ok" : "badge-fail"}">Critic ${esc(critic.status)}</span>`
+        : "";
+      const deltaSummary = delta
+        ? `<span class="delta-fixed">修复 ${delta.fixed}</span>
+           <span class="delta-broken">新破坏 ${delta.broken}</span>
+           <span class="delta-unresolved">未解决 ${delta.unresolved}</span>
+           ${delta.partial ? '<span class="muted">（探针部分结果）</span>' : ""}`
+        : "";
       const promptBlock = iteration.promptChanged
         ? `<div class="rationale"><b>提示词修改理由：</b>${esc(iteration.promptRationale || "未说明")} ${iteration.accepted ? "" : "（本轮未采纳）"}</div>
            <div class="compare">${promptBox("提示词修改前", promptBefore)}${promptBox("提示词修改后", iteration.semanticPrompt)}</div>`
@@ -1332,6 +1403,11 @@
           ${badge}
           <span class="muted">耗时 ${((iteration.durationMs || 0) / 1000).toFixed(1)} 秒</span>
         </div>
+        ${iteration.selectionReason ? `<div class="selection-reason">${esc(iteration.selectionReason)}</div>` : ""}
+        <div class="iteration-checks">${probeBadge}${criticBadge}${deltaSummary}</div>
+        ${critic && critic.reasons && critic.reasons.length ? `<div class="critic-reasons">${critic.reasons.map(esc).join("；")}</div>` : ""}
+        ${renderDiagnosis(iteration.diagnosis || {})}
+        ${renderOperations(iteration.operations || [])}
         <div class="rationale"><b>修改理由：</b>${esc(iteration.rationale || "无修改说明")}</div>
         ${renderIterationContext(iteration)}
         ${iteration.expectedEffect ? `<div class="expected">预期效果：${esc(iteration.expectedEffect)}</div>` : ""}
@@ -1339,10 +1415,12 @@
         ${promptBlock}
         ${iteration.promptRegression ? renderPromptRegression(iteration.promptRegression) : ""}
         <div class="iteration-cases">
+          <button class="btn small ghost" type="button" data-iter-delta="${esc(job.id)}" data-iter-index="${iteration.index}">本轮逐条差异</button>
           <button class="btn small ghost" type="button" data-iter-cases="${esc(job.id)}" data-iter-index="${iteration.index}" data-iter-split="TRAIN">训练集逐条结果</button>
           <button class="btn small ghost" type="button" data-iter-cases="${esc(job.id)}" data-iter-index="${iteration.index}" data-iter-split="VALIDATION">验证集逐条结果</button>
-          <span class="muted">训练集含正则+语义理由；验证集仅正则理由；测试集只在最终验收评测</span>
+          <span class="muted">逐条差异：修复/新破坏/未解决；训练集含正则+语义理由；验证集仅正则理由；测试集只在最终验收评测</span>
           <div class="iteration-cases-area" data-iter-area="${iteration.index}"></div>
+          <div class="iteration-delta-area" data-iter-delta-area="${iteration.index}"></div>
         </div>
         <div class="chip-row">
           <span class="chip">验证精确率 ${pct(validation.precision)}</span>
@@ -1354,6 +1432,36 @@
         </div>
       </div>`;
     }).join("");
+  }
+
+  async function loadIterationDelta(jobId, index, area) {
+    if (!area) return;
+    area.innerHTML = '<div class="muted">正在加载逐条差异…</div>';
+    try {
+      const data = await api(`/api/jobs/${encodeURIComponent(jobId)}/iterations/${index}/delta`);
+      const rows = data.rows || [];
+      if (!rows.length) {
+        area.innerHTML = '<div class="empty small">该轮没有逐条差异</div>';
+        return;
+      }
+      const labels = { FIXED: "修复", BROKEN: "新破坏", UNRESOLVED: "仍未解决", UNCHANGED: "保持正确" };
+      area.innerHTML = `<div class="iteration-cases-head">逐条差异 ${rows.length} 条${data.caseDelta && data.caseDelta.partial ? "（探针部分结果）" : ""}</div>
+        <div class="table-wrap"><table>
+          <thead><tr><th>类型</th><th>通话ID</th><th>人工</th><th>修改前</th><th>修改后</th><th>正则理由</th><th>语义理由</th><th>通话文本</th></tr></thead>
+          <tbody>${rows.map((row) => `<tr class="clickable">
+            <td><span class="delta-${esc(row.kind.toLowerCase())}">${esc(labels[row.kind] || row.kind)}</span></td>
+            <td class="mono">${esc(row.callId)}</td>
+            <td>${labelPill(row.humanResult)}</td>
+            <td>${predPill(row.beforePredicted)}</td>
+            <td>${predPill(row.afterPredicted)}</td>
+            <td class="reason-cell">${esc(row.regexReason || "")}</td>
+            <td class="reason-cell">${esc(row.semanticReason || "")}</td>
+            <td class="transcript">${transcriptBlock(row.transcript)}</td>
+          </tr>`).join("")}</tbody>
+        </table></div>`;
+    } catch (error) {
+      area.innerHTML = `<div class="job-error">${esc(error.message)}</div>`;
+    }
   }
 
   async function loadIterationCases(jobId, index, split, area) {

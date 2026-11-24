@@ -38,12 +38,14 @@ from .models import (
     NORMAL, VIOLATION, ApplyInput, BatchOptimizeInput, OptimizeInput, PromptInput, RuleInput, SettingsInput, rule_flags,
 )
 from .data_governance import refresh_dataset, sync_label_codes
+from .demo_scenario import build_demo_calls
 from .governance import (register_governance, enrich_rule, enrich_rules, model_manifest,
                          assert_no_holdout_overlap)
 from .experiments import freeze_experiment, checkpoint, restore_jobs, code_fingerprint
 from .capabilities import regex_evidence, role_context_valid
 from .regex_safety import RegexTimeout
 from .optimizer import LLMProposer, MockProposer, optimize
+from .mock_judge import mock_judge
 from .regex_policy import MAX_REGEX_LENGTH
 from .prompts import DEFAULT_SEMANTIC_PROMPT, render_prompt, validate_prompt
 from .prompt_regression import context_fingerprint, make_prompt_guard, rules_with_candidate
@@ -55,7 +57,7 @@ STATIC_DIR = BASE_DIR / "static"
 JOB_LOG_DIR = BASE_DIR / ".run" / "jobs"
 JOB_LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="质检能力自进化工作台", version="3.0.1")
+app = FastAPI(title="质检能力自进化工作台", version="3.0.2")
 store = Store(Path(os.environ.get("QCO_STORE", str(STORE_PATH))))
 RUNTIME: Dict[str, str] = {"apiKey": os.environ.get("DEEPSEEK_API_KEY", "")}
 CHECKPOINT_DIR = store.path.parent / "job-checkpoints"
@@ -563,6 +565,22 @@ async def test_regex(rule_id: str, payload: RegexTestInput) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------- 数据
+@app.post("/api/demo/reset")
+async def reset_demo_data() -> Dict[str, Any]:
+    settings = store.settings()
+    if settings.get("mode") != "mock":
+        raise HTTPException(status_code=400, detail="只有模拟演示模式可以载入演示数据")
+    _ensure_no_active_job()
+
+    def mutate(state: Dict[str, Any]) -> Dict[str, Any]:
+        state["calls"] = build_demo_calls()
+        _rebuild_splits(state)
+        state["runs"] = []
+        return {"ok": True, "calls": len(state["calls"])}
+
+    return store.mutate(mutate)
+
+
 @app.get("/api/dataset")
 async def get_dataset_overview() -> Dict[str, Any]:
     state = store.snapshot()
@@ -679,7 +697,7 @@ async def sample_dataset() -> Response:
 # ---------------------------------------------------------------- 优化任务
 def _job_public(job: Dict[str, Any]) -> Dict[str, Any]:
     return {key: value for key, value in job.items() if not key.endswith("Rows")
-            and not key.startswith("_") and key != "cancelRequested"}
+            and key != "iterationDeltas" and not key.startswith("_") and key != "cancelRequested"}
 
 
 def _append_job_file(job: Dict[str, Any], text: str) -> None:
@@ -758,12 +776,15 @@ def _emit(job: Dict[str, Any], event: Dict[str, Any]) -> None:
         iteration = dict(event.get("iteration") or {})
         train_rows = iteration.pop("trainRows", None)
         validation_rows = iteration.pop("validationRows", None)
+        delta_rows = iteration.pop("caseDeltaRows", None)
         job.setdefault("iterations", []).append(iteration)
         if train_rows is not None or validation_rows is not None:
             job.setdefault("iterationRows", {})[str(iteration.get("index"))] = {
                 TRAIN: train_rows or [],
                 VALIDATION: validation_rows or [],
             }
+        if delta_rows is not None:
+            job.setdefault("iterationDeltas", {})[str(iteration.get("index"))] = delta_rows
         line = (
             f"[ITER] 第{iteration.get('index')}轮 训练={iteration.get('metrics', {}).get('accuracy')} "
             f"验证={iteration.get('validationMetrics', {}).get('accuracy')} "
@@ -838,13 +859,10 @@ def _save_run(job: Dict[str, Any]) -> None:
 def _make_judge_factory(llm: Optional[LLMClient], all_rules: List[Dict[str, Any]]):
     def factory(prompt: str, with_reason: bool):
         if llm is None:
-            async def mock_judge(case: Dict[str, Any], rule: Dict[str, Any]):
-                if rule.get("workflow") == "COMPLAINT_RESPONSE":
-                    return {"violation": None, "reason": "投诉分步判断需真实模型，模拟模式不生成语义结论",
-                            "reviewRequired": True, "evidenceValid": False}
-                return False, ("模拟模式：语义部分未调用模型" if with_reason else "")
+            async def mock_judge_adapter(case: Dict[str, Any], rule: Dict[str, Any]):
+                return await mock_judge(case, rule, with_reason)
 
-            return mock_judge
+            return mock_judge_adapter
 
         async def judge(case: Dict[str, Any], rule: Dict[str, Any]):
             return await judge_semantic(llm, case, rule, prompt, rules_with_candidate(all_rules, rule), with_reason)
@@ -894,6 +912,11 @@ async def _execute_optimize(
             return await judge_semantic(llm, case, enrich_rule(state, other_rule), semantic_prompt,
                                         [enrich_rule(state, item) for item in regression_rules], False)
 
+        policy = dict(job.get("policy") or {})
+        if settings.get("mode") != "deepseek":
+            # 演示数据只有 10 通，按真实每类 5 条会永远无法验收；演示模式明确放宽到每类 1 条。
+            policy["minPerClass"] = 1
+            job["policy"] = policy
         result = await optimize(
             rule, cases, job["target"], job["maxRounds"],
             _make_judge_factory(llm, all_rules), proposer, prompt,
@@ -903,7 +926,7 @@ async def _execute_optimize(
                 state, rule, regression_judge, lambda event: _emit(job, event),
                 lambda: bool(job.get("cancelRequested")),
             ),
-            policy=job.get("policy"),
+            policy=policy,
         )
         job["status"] = result["status"]
         job["baseline"] = result["baseline"]["train"]["metrics"]
@@ -921,15 +944,18 @@ async def _execute_optimize(
         job["bestRows"] = result["best"]["test"]["rows"]
         job["iterations"] = []
         job["iterationRows"] = {}
+        job["iterationDeltas"] = {}
         for item in result["iterations"]:
             clean = dict(item)
             train_rows = clean.pop("trainRows", [])
             validation_rows = clean.pop("validationRows", [])
+            delta_rows = clean.pop("caseDeltaRows", [])
             job["iterations"].append(clean)
             job["iterationRows"][str(clean.get("index"))] = {
                 TRAIN: train_rows or [],
                 VALIDATION: validation_rows or [],
             }
+            job["iterationDeltas"][str(clean.get("index"))] = delta_rows or []
         job["gate"] = result["gate"]
         job["splitSummary"] = result["splitSummary"]
         job["baselinePrompt"] = result["baselinePrompt"]
@@ -1379,6 +1405,9 @@ async def start_batch_optimize(payload: BatchOptimizeInput) -> Dict[str, Any]:
     settings = store.settings()
     _ensure_llm_ready(settings)
     _ensure_no_active_job()
+    policy = payload.evaluationPolicy.dict()
+    if settings.get("mode") != "deepseek":
+        policy["minPerClass"] = 1
     parent = {
         "id": "job-" + uuid.uuid4().hex[:8],
         "kind": "batch",
@@ -1397,7 +1426,7 @@ async def start_batch_optimize(payload: BatchOptimizeInput) -> Dict[str, Any]:
         "logs": [],
         "error": None,
         "cancelRequested": False,
-        "policy": payload.evaluationPolicy.dict(),
+        "policy": policy,
     }
     freeze_experiment(state, parent, EXPERIMENT_DIR)
     JOBS[parent["id"]] = parent
@@ -1507,6 +1536,19 @@ async def get_job_log(job_id: str) -> PlainTextResponse:
         content or "（暂无日志）",
         headers={"Content-Disposition": f"attachment; filename={job_id}.log"},
     )
+
+
+@app.get("/api/jobs/{job_id}/iterations/{index}/delta")
+async def get_iteration_delta(job_id: str, index: int) -> Dict[str, Any]:
+    job = JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="任务不存在或已过期")
+    rows = (job.get("iterationDeltas") or {}).get(str(index))
+    if rows is None:
+        raise HTTPException(status_code=404, detail="该轮没有逐条差异")
+    iteration = next((item for item in job.get("iterations") or []
+                      if int(item.get("index") or 0) == index), {})
+    return {"index": index, "caseDelta": iteration.get("caseDelta"), "rows": rows}
 
 
 @app.get("/api/jobs/{job_id}/iterations/{index}/cases")

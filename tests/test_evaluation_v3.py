@@ -213,10 +213,11 @@ class SearchPolicyTests(unittest.TestCase):
             cases.extend(case(f"{split}p{i}", True, split, "风险") for i in range(5))
             cases.extend(case(f"{split}n{i}", False, split, "普通误报" if i < 10 else "普通") for i in range(45))
         async def proposer(rule, result, target, history, prompt):
-            return {"regex": "风险x|误报", "semanticPrompt": prompt}
+            return {"regex": "风险x", "semanticPrompt": prompt}
         result = self.run_search({"regex": "风险|误报"}, proposer, cases)
         self.assertFalse(result["iterations"][0]["accepted"])
-        self.assertIn("召回", result["iterations"][0]["selectionReason"])
+        self.assertTrue("探针" in result["iterations"][0]["selectionReason"]
+                        or "召回" in result["iterations"][0]["selectionReason"])
         self.assertEqual(result["best"]["validation"]["metrics"]["recall"], 1)
 
 

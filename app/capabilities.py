@@ -9,9 +9,10 @@ from .regex_safety import safe_search
 from typing import Any, Dict, List, Optional
 
 MAX_CAPABILITY_CHARS = 20000
-_TIME = r"(?:\[\s*\d{1,2}:\d{2}(?::\d{2})?(?:[.,]\d+)?\s*\]|\d{1,2}:\d{2}(?::\d{2})?(?:[.,]\d+)?)"
+_DATE_TIME = r"\d{4}-\d{2}-\d{2}[ T]\d{1,2}:\d{2}(?::\d{2})?"
+_TIME = r"(?:\[\s*\d{1,2}:\d{2}(?::\d{2})?(?:[.,]\d+)?\s*\]|" + _DATE_TIME + r"|\d{1,2}:\d{2}(?::\d{2})?(?:[.,]\d+)?)"
 _TURN = re.compile(
-    r"^[ \t]*(?:" + _TIME + r"[ \t]*)?"
+    r"^[ \t]*[（(]?(?:" + _TIME + r"[ \t]*)?"
     r"(?P<label>客户经理|客服人员|坐席|客服|客户|用户|agent|customer)"
     r"[ \t]*(?:" + _TIME + r"[ \t]*)?[:：][ \t]*",
     re.MULTILINE | re.IGNORECASE,
@@ -46,7 +47,7 @@ def parse_transcript(transcript: str) -> Dict[str, Any]:
     errors = []
     if not turns:
         errors.append("转写没有可识别的客户/坐席话轮")
-    elif text[:turns[0]["sourceStart"]].strip():
+    elif text[:turns[0]["sourceStart"]].strip() not in ("", "（", "("):
         errors.append("转写开头存在无法归属角色的内容")
     for turn in turns:
         if not turn["text"].strip():

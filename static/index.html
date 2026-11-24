@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>质检能力自进化工作台</title>
-  <link rel="stylesheet" href="/static/style.css?v=3.0.1" />
+  <link rel="stylesheet" href="/static/style.css?v=3.0.2" />
 </head>
 <body>
   <header class="topbar">
@@ -16,7 +16,7 @@
       </div>
     </div>
     <div class="top-actions">
-      <span id="buildTag" class="muted" style="font-size:12px">v3.0.1</span>
+      <span id="buildTag" class="muted" style="font-size:12px">v3.0.2</span>
       <span id="modeBadge" class="badge badge-mock">模拟演示</span>
       <button id="settingsBtn" class="btn ghost" type="button">模型设置</button>
     </div>
@@ -139,6 +139,8 @@
             <div class="link-row">
               <a id="sampleLink" class="link" href="/api/dataset/sample.csv">下载 10 通示例 CSV</a>
               <a id="exportLink" class="link" href="/api/dataset/export.csv" hidden>导出全部通话</a>
+              <button id="demoDataBtn" class="btn small ghost" type="button">载入 40 通演示场景</button>
+              <span id="demoDataStatus" class="muted"></span>
             </div>
           </div>
           <p class="hint">
@@ -471,7 +473,7 @@
     </form>
   </dialog>
 
-  <script src="/static/app.js?v=3.0.1"></script>
-  <script src="/static/governance.js?v=3.0.1"></script>
+  <script src="/static/app.js?v=3.0.2"></script>
+  <script src="/static/governance.js?v=3.0.2"></script>
 </body>
 </html>
